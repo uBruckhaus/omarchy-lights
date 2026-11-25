@@ -42,9 +42,6 @@ def _config_home():
 
 CONFIG_DIR = os.path.join(_config_home(), "omarchy", "lights")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
-DEFAULT_CONFIG_DIR = CONFIG_DIR
-# Folder of the earlier Hue Lights plugin (ubruckhaus.hue-lights); read once by migrate_legacy_config().
-LEGACY_CONFIG_DIR = os.path.join(_config_home(), "omarchy", "hue-lights")
 
 POLL_OPEN = 2.0       # seconds between refreshes while the panel is open
 POLL_CLOSED = 20.0    # seconds between refreshes while it is closed
@@ -3907,61 +3904,6 @@ def load_config():
     return data
 
 
-def migrate_legacy_config():
-    """One-time import from the Hue Lights folder (~/.config/omarchy/hue-lights) into a missing Lights folder.
-
-    Runs only for the default folder and only while it does not exist yet. The old files are read
-    through the same validating loaders (regular, owner-owned, no symlinks/FIFOs, size-capped), and
-    only when it holds a valid Hue Lights pairing, so another plugin's files there are ignored.
-    Nothing in the old folder is changed.
-    A floorplan background image is not carried over (it must live inside the new folder)."""
-    global CONFIG_DIR, CONFIG_PATH
-    if CONFIG_DIR != DEFAULT_CONFIG_DIR or os.path.lexists(CONFIG_DIR):
-        return False
-    try:
-        info = os.lstat(LEGACY_CONFIG_DIR)
-    except OSError:
-        return False
-    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
-        return False
-    new_dir, new_path = CONFIG_DIR, CONFIG_PATH
-    try:
-        CONFIG_DIR, CONFIG_PATH = LEGACY_CONFIG_DIR, os.path.join(LEGACY_CONFIG_DIR, "config.json")
-        old = {
-            "config": load_config(),
-            "rules": load_rules(),
-            "themes": load_themes(),
-            "schedules": load_local_schedules(),
-            "floorplan": load_floorplan(),
-        }
-    except Exception:
-        return False
-    finally:
-        CONFIG_DIR, CONFIG_PATH = new_dir, new_path
-    if not old["config"]:
-        # No valid Hue Lights pairing there: empty, or another plugin's folder. Import nothing.
-        return False
-    try:
-        private_config_dir()
-        save_config(old["config"])
-        if old["rules"] and (old["rules"].get("rules") or old["rules"].get("paused")):
-            save_rules(old["rules"])
-        if old["themes"]:
-            save_themes(old["themes"])
-        if old["schedules"].get("schedules") or old["schedules"].get("mode") != "bridge":
-            save_local_schedules(old["schedules"])
-        fp = old["floorplan"]
-        if isinstance(fp, dict):
-            bg = dict(fp.get("background") or {})
-            if bg.get("path"):
-                bg["path"] = ""
-                fp["background"] = bg
-            save_floorplan(fp)
-    except (OSError, ValueError, TypeError):
-        return False
-    return True
-
-
 def save_config(data):
     """Atomic 0600 write via a unique temp file (never a predictable name, never a followed link)."""
     directory = private_config_dir()
@@ -5087,7 +5029,6 @@ class Hue:
         self.sse_wake = threading.Event()
         self._stop = threading.Event()
         self._sse_sock = None
-        migrate_legacy_config()
         self.config = load_config()
         self.panel_open = False
         self.rooms = []

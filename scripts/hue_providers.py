@@ -1531,6 +1531,8 @@ class ProviderManager:
         self._next_poll_at = {}        # conn_id -> monotonic timestamp
         # Server-side one-time pairing tokens (never emitted in snapshots!)
         self._paired_tokens = {}       # pair_id -> {"kind", "host", "port", "token", "fp", "expires"}
+        self._send_locks = {}          # conn_id -> Lock held while a command is sent / the connection is edited
+        self._spare_send_lock = threading.Lock()
         self._pending_cmds = {}        # (kind, rid) -> (conn generation, body) (coalesced & bounded)
         self._refresh_hold_until = 0.0
         self._last_refresh = 0.0
@@ -1707,6 +1709,10 @@ class ProviderManager:
         return cand
 
     def trust_new_certificate(self, cid):
+        with self._send_lock(cid):
+            return self._trust_new_certificate_unlocked(cid)
+
+    def _trust_new_certificate_unlocked(self, cid):
         """B4: Clear the pinned TLS fingerprint while keeping the connection ID and saved token."""
         found = False
         with self.lock:
@@ -1730,6 +1736,10 @@ class ProviderManager:
         clean_c = self._resolve_saved_or_paired_secret(raw, consume_pair=True)
         if not clean_c:
             raise ProviderError("Invalid device configuration (check local IP / host).")
+        with self._send_lock(clean_c["id"]):
+            return self._save_connection_unlocked(clean_c)
+
+    def _save_connection_unlocked(self, clean_c):
         meta = PROVIDER_KINDS[clean_c["kind"]]
         if meta["requires_token"] and not clean_c["token"]:
             raise ProviderError("Access token is required (enter a token or re-pair for this host).")
@@ -1761,6 +1771,10 @@ class ProviderManager:
         return clean_c
 
     def remove_connection(self, cid):
+        with self._send_lock(cid):
+            return self._remove_connection_unlocked(cid)
+
+    def _remove_connection_unlocked(self, cid):
         with self.lock:
             self.connections = [c for c in self.connections if c["id"] != cid]
             self.conn_generations[cid] = self.conn_generations.get(cid, 0) + 1
@@ -1776,6 +1790,10 @@ class ProviderManager:
         self.save()
 
     def toggle_connection(self, cid, enabled):
+        with self._send_lock(cid):
+            return self._toggle_connection_unlocked(cid, enabled)
+
+    def _toggle_connection_unlocked(self, cid, enabled):
         with self.lock:
             for c in self.connections:
                 if c["id"] == cid:
@@ -2179,6 +2197,12 @@ class ProviderManager:
                 self._drain_pending()
 
     def set_light(self, rid, body, gen=None):
+        # Held for the whole send: edit/toggle/remove/trust of this connection wait until it is done,
+        # so a command can never go to a host that was replaced while it was in flight.
+        with self._send_lock(self._rid_conn_id(rid)):
+            return self._set_light_unlocked(rid, body, gen)
+
+    def _set_light_unlocked(self, rid, body, gen=None):
         parts = rid.split(":", 2)
         if len(parts) < 3:
             return
@@ -2343,6 +2367,19 @@ class ProviderManager:
                     expected_fp=expected_fp,
                 )
 
+    def _send_lock(self, cid):
+        """Per-connection send/edit lock. Only saved connections get their own lock (the panel can
+        name arbitrary IDs, so unknown ones share one lock instead of growing the table)."""
+        cid = str(cid or "")
+        with self.lock:
+            lk = self._send_locks.get(cid)
+            if lk is None:
+                if any(c["id"] == cid for c in self.connections):
+                    lk = self._send_locks[cid] = threading.Lock()
+                else:
+                    lk = self._spare_send_lock
+            return lk
+
     def _conn_for(self, cid, gen):
         """Enabled connection `cid` as a copy, only while it still has generation `gen` (None: any).
         Caller holds self.lock, so the check and the choice of host happen together."""
@@ -2351,6 +2388,10 @@ class ProviderManager:
         return next((dict(c) for c in self.connections if c["id"] == cid and c.get("enabled")), None)
 
     def recall_scene(self, rid, gen=None):
+        with self._send_lock(self._rid_conn_id(rid)):
+            return self._recall_scene_unlocked(rid, gen)
+
+    def _recall_scene_unlocked(self, rid, gen=None):
         parts = rid.split(":", 2)
         if len(parts) < 3:
             return

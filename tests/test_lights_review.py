@@ -1,4 +1,4 @@
-"""Regression tests for the Lights 1.0.0 review fixes and the Hue Lights folder migration."""
+"""Regression tests for the Lights 1.0.0 review fixes."""
 import importlib.util
 import json
 import os
@@ -144,6 +144,31 @@ class PendingCommandTests(unittest.TestCase):
             self._real_set_light("wled:c1:0", body, gen=gen)
         self.assertEqual(sent_http, [])
 
+    def test_edit_waits_for_in_flight_send(self):
+        import time
+        started, order = threading.Event(), []
+        self.mgr.save = lambda: None
+
+        def slow_http(*a, **k):
+            started.set()
+            time.sleep(0.3)
+            order.append("sent")
+            return 200, b"{}"
+
+        with mock.patch.object(prov, "_http_request", side_effect=slow_http):
+            t = threading.Thread(target=lambda: self._real_set_light("wled:c1:0", {"on": {"on": True}}, gen=1))
+            t.start()
+            started.wait(2)
+            self.mgr.remove_connection("c1")
+            order.append("removed")
+            t.join(3)
+        self.assertEqual(order, ["sent", "removed"])
+
+    def test_unknown_ids_share_one_lock(self):
+        for i in range(50):
+            self.mgr._send_lock("x%d" % i)
+        self.assertNotIn("x1", self.mgr._send_locks)
+
     def test_remove_connection_drops_queue(self):
         self.mgr.queue_command("light", "wled:c1:0", {"on": {"on": False}})
         self.mgr.remove_connection("c1")
@@ -170,88 +195,6 @@ class HomeAssistantPinTests(unittest.TestCase):
             mgr.fetch_single(conn, gen=None)
         self.assertEqual(calls[0], ("/api/states", ""))
         self.assertEqual(calls[1], ("/api/template", "a" * 64))
-
-
-class LegacyMigrationTests(unittest.TestCase):
-    def setUp(self):
-        self.home = tempfile.mkdtemp()
-        self.old = os.path.join(self.home, "omarchy", "hue-lights")
-        self.new = os.path.join(self.home, "omarchy", "lights")
-        self.saved = (hue.CONFIG_DIR, hue.CONFIG_PATH, hue.DEFAULT_CONFIG_DIR, hue.LEGACY_CONFIG_DIR)
-        hue.CONFIG_DIR = hue.DEFAULT_CONFIG_DIR = self.new
-        hue.CONFIG_PATH = os.path.join(self.new, "config.json")
-        hue.LEGACY_CONFIG_DIR = self.old
-
-    def tearDown(self):
-        hue.CONFIG_DIR, hue.CONFIG_PATH, hue.DEFAULT_CONFIG_DIR, hue.LEGACY_CONFIG_DIR = self.saved
-        shutil.rmtree(self.home, ignore_errors=True)
-
-    def _old_file(self, name, data, mode=0o600):
-        os.makedirs(self.old, mode=0o700, exist_ok=True)
-        p = os.path.join(self.old, name)
-        with open(p, "w") as fh:
-            fh.write(data if isinstance(data, str) else json.dumps(data))
-        os.chmod(p, mode)
-        return p
-
-    GOOD = {"ip": "192.168.178.106", "app_key": "abcDEF123_-", "fingerprint": "b" * 64,
-            "bridge_id": "c42996fffec9b46d".upper(), "name": "Hue Bridge"}
-
-    def test_copies_valid_pairing_and_leaves_old_untouched(self):
-        p = self._old_file("config.json", self.GOOD)
-        before = open(p).read()
-        self.assertTrue(hue.migrate_legacy_config())
-        self.assertEqual(hue.load_config()["bridge_id"].lower(), "c42996fffec9b46d")
-        self.assertEqual(stat.S_IMODE(os.stat(os.path.join(self.new, "config.json")).st_mode), 0o600)
-        self.assertEqual(stat.S_IMODE(os.stat(self.new).st_mode), 0o700)
-        self.assertEqual(open(p).read(), before)
-        self.assertFalse(hue.migrate_legacy_config())  # one time only
-
-    def test_other_plugins_format_is_ignored(self):
-        self._old_file("config.json", {"bridge_ip": "192.168.1.2", "username": "x"})
-        self._old_file("local_schedules.json", {"mode": "local", "schedules": []})
-        self.assertFalse(hue.migrate_legacy_config())
-        self.assertEqual(hue.load_config(), {})
-        self.assertFalse(os.path.lexists(self.new))  # no valid pairing: nothing imported, later import still possible
-
-    def test_symlinked_files_and_dir_are_not_followed(self):
-        secret = os.path.join(self.home, "elsewhere.json")
-        with open(secret, "w") as fh:
-            json.dump(self.GOOD, fh)
-        os.makedirs(self.old, mode=0o700)
-        os.symlink(secret, os.path.join(self.old, "config.json"))
-        hue.migrate_legacy_config()
-        self.assertEqual(hue.load_config(), {})
-        shutil.rmtree(self.new, ignore_errors=True)
-        shutil.rmtree(self.old)
-        real = os.path.join(self.home, "real")
-        os.makedirs(real, mode=0o700)
-        with open(os.path.join(real, "config.json"), "w") as fh:
-            json.dump(self.GOOD, fh)
-        os.symlink(real, self.old)
-        self.assertFalse(hue.migrate_legacy_config())
-        self.assertFalse(os.path.lexists(self.new))
-
-    def test_fifo_in_old_folder_does_not_block(self):
-        os.makedirs(self.old, mode=0o700)
-        os.mkfifo(os.path.join(self.old, "config.json"), 0o600)
-        done = []
-        t = threading.Thread(target=lambda: done.append(hue.migrate_legacy_config()), daemon=True)
-        t.start()
-        t.join(3)
-        self.assertTrue(done)
-
-    def test_skipped_when_new_folder_exists_or_dir_overridden(self):
-        self._old_file("config.json", self.GOOD)
-        os.makedirs(self.new, mode=0o700)
-        self.assertFalse(hue.migrate_legacy_config())
-        self.assertEqual(hue.load_config(), {})
-        shutil.rmtree(self.new)
-        hue.CONFIG_DIR = os.path.join(self.home, "custom")
-        try:
-            self.assertFalse(hue.migrate_legacy_config())
-        finally:
-            hue.CONFIG_DIR = self.new
 
 
 if __name__ == "__main__":
