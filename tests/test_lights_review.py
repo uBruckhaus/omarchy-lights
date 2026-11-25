@@ -80,6 +80,14 @@ class ProvidersFileTests(unittest.TestCase):
         self.assertTrue(mgr._load_blocked)
 
 
+class BridgeIpTests(unittest.TestCase):
+    def test_bridge_ip_only_home_lan(self):
+        for ok in ("192.168.178.106", "10.0.0.2", "172.20.1.1", "169.254.3.4"):
+            self.assertTrue(hue.valid_bridge_ip(ok), ok)
+        for bad in ("198.18.0.1", "100.64.1.1", "192.0.0.9", "192.0.2.5", "0.0.0.1", "169.254.169.254"):
+            self.assertFalse(hue.valid_bridge_ip(bad), bad)
+
+
 class PendingCommandTests(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp()
@@ -90,7 +98,15 @@ class PendingCommandTests(unittest.TestCase):
                                  "enabled": True, "cert_fingerprint": ""}]
         self.mgr.conn_generations = {"c1": 1}
         self.sent = []
-        self.mgr.set_light = lambda rid, body: self.sent.append((rid, body))
+        real_set_light = self.mgr.set_light
+
+        def spy(rid, body, gen=None):
+            with self.mgr.lock:
+                conn = self.mgr._conn_for(self.mgr._rid_conn_id(rid), gen)
+            if conn:
+                self.sent.append((rid, body))
+        self.mgr.set_light = spy
+        self._real_set_light = real_set_light
 
     def tearDown(self):
         shutil.rmtree(self.dir, ignore_errors=True)
@@ -116,6 +132,17 @@ class PendingCommandTests(unittest.TestCase):
         self.mgr.queue_command("light", "wled:c1:0", {"dimming": {"brightness": 50}})
         self.assertTrue(self.mgr._drain_pending())
         self.assertEqual(self.sent, [("wled:c1:0", {"on": {"on": True}, "dimming": {"brightness": 50}})])
+
+    def test_edit_after_dequeue_is_dropped_inside_set_light(self):
+        self.mgr.queue_command("light", "wled:c1:0", {"on": {"on": True}})
+        sent_http = []
+        with self.mgr.lock:
+            key, (gen, body) = next(iter(self.mgr._pending_cmds.items()))
+            del self.mgr._pending_cmds[key]
+            self.mgr.conn_generations["c1"] += 1  # host edited after the command left the queue
+        with mock.patch.object(prov, "_http_request", side_effect=lambda *a, **k: sent_http.append(a) or (200, b"{}")):
+            self._real_set_light("wled:c1:0", body, gen=gen)
+        self.assertEqual(sent_http, [])
 
     def test_remove_connection_drops_queue(self):
         self.mgr.queue_command("light", "wled:c1:0", {"on": {"on": False}})
@@ -182,8 +209,10 @@ class LegacyMigrationTests(unittest.TestCase):
 
     def test_other_plugins_format_is_ignored(self):
         self._old_file("config.json", {"bridge_ip": "192.168.1.2", "username": "x"})
-        hue.migrate_legacy_config()
+        self._old_file("local_schedules.json", {"mode": "local", "schedules": []})
+        self.assertFalse(hue.migrate_legacy_config())
         self.assertEqual(hue.load_config(), {})
+        self.assertFalse(os.path.lexists(self.new))  # no valid pairing: nothing imported, later import still possible
 
     def test_symlinked_files_and_dir_are_not_followed(self):
         secret = os.path.join(self.home, "elsewhere.json")

@@ -201,13 +201,22 @@ def valid_uuid(value):
     return isinstance(value, str) and UUID_RE.match(value) is not None
 
 
+# Home LAN only: RFC 1918 and IPv4 link-local. ipaddress.is_private also covers 0/8, 192.0.0/24,
+# 198.18/15 (benchmarking) and the documentation ranges.
+BRIDGE_NETWORKS = tuple(ipaddress.ip_network(n) for n in (
+    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16",
+))
+
+
 def valid_bridge_ip(value):
-    """Only private / link-local IPv4 literals: the bridge is always on the LAN."""
+    """Only home-LAN IPv4 literals: the bridge is always on the LAN."""
     try:
         ip = ipaddress.IPv4Address(str(value))
     except (ipaddress.AddressValueError, ValueError):
         return False
-    return ip.is_private and not ip.is_loopback and not ip.is_unspecified and not ip.is_multicast
+    if str(ip) == "169.254.169.254":
+        return False
+    return any(ip in net for net in BRIDGE_NETWORKS)
 
 
 def clamp(value, low, high):
@@ -3902,8 +3911,9 @@ def migrate_legacy_config():
     """One-time import from the Hue Lights folder (~/.config/omarchy/hue-lights) into a missing Lights folder.
 
     Runs only for the default folder and only while it does not exist yet. The old files are read
-    through the same validating loaders (regular, owner-owned, no symlinks/FIFOs, size-capped), so a
-    different plugin's files in that folder are ignored, and nothing in the old folder is changed.
+    through the same validating loaders (regular, owner-owned, no symlinks/FIFOs, size-capped), and
+    only when it holds a valid Hue Lights pairing, so another plugin's files there are ignored.
+    Nothing in the old folder is changed.
     A floorplan background image is not carried over (it must live inside the new folder)."""
     global CONFIG_DIR, CONFIG_PATH
     if CONFIG_DIR != DEFAULT_CONFIG_DIR or os.path.lexists(CONFIG_DIR):
@@ -3928,10 +3938,12 @@ def migrate_legacy_config():
         return False
     finally:
         CONFIG_DIR, CONFIG_PATH = new_dir, new_path
+    if not old["config"]:
+        # No valid Hue Lights pairing there: empty, or another plugin's folder. Import nothing.
+        return False
     try:
         private_config_dir()
-        if old["config"]:
-            save_config(old["config"])
+        save_config(old["config"])
         if old["rules"] and (old["rules"].get("rules") or old["rules"].get("paused")):
             save_rules(old["rules"])
         if old["themes"]:

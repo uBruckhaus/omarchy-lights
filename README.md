@@ -20,7 +20,7 @@ Control your smart lights from the Omarchy bar — **Philips Hue**, **Home Assis
 - **Bridge Pro MotionAware™ & Physical Hue Sensors:** Live MotionAware™ presence indicators on rooms and lamps, per-area enable and sensitivity controls, and physical Hue motion, contact, and switch sensors placeable on the Map and usable as Rule triggers.
 - **Animated Help & Guide (`?`):** Built-in 9-card visual feature tour with lightweight pure-vector animations (running only while open).
 - **Optional Ask AI (off by default):** Opt in under Settings (**Ask AI (Optional)**) to reveal the compact **✦** header button and control lamps, rooms, scenes, rules, and schedules in plain language via the zero-dependency local parser (`scripts/hue-ai.py`), with optional local-only Ollama fallback (`http://127.0.0.1:11434`). When off, no AI UI is shown outside Settings & Help.
-- **Local MCP Server for AI Agents:** External AI agents can connect over local stdio (`python3 -I scripts/hue-mcp.py`) to inspect and control lights, scenes, sensors, schedules, and rules while Hue Bridge credentials remain private inside `~/.config/omarchy/hue-lights/config.json`.
+- **Local MCP Server for AI Agents:** External AI agents can connect over local stdio (`python3 -I scripts/hue-mcp.py`) to inspect and control lights, scenes, sensors, schedules, and rules while Hue Bridge credentials remain private inside `~/.config/omarchy/lights/config.json`.
 
 ## Languages and settings
 

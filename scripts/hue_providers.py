@@ -1868,17 +1868,14 @@ class ProviderManager:
                 return False
             key, (gen, body) = next(iter(self._pending_cmds.items()))
             del self._pending_cmds[key]
-            stale = self.conn_generations.get(self._rid_conn_id(key[1]), 0) != gen
-        if stale:
-            return True
         kind, rid = key
         try:
             if kind == "scene":
-                self.recall_scene(rid)
+                self.recall_scene(rid, gen=gen)
                 self._refresh_hold_until = time.time() + 0.5
                 self._last_refresh = 0.0
             else:
-                self.set_light(rid, body)
+                self.set_light(rid, body, gen=gen)
         except Exception as exc:  # noqa: BLE001
             parts = rid.split(":", 2)
             if len(parts) >= 2:
@@ -2181,13 +2178,14 @@ class ProviderManager:
                     pass
                 self._drain_pending()
 
-    def set_light(self, rid, body):
+    def set_light(self, rid, body, gen=None):
         parts = rid.split(":", 2)
         if len(parts) < 3:
             return
         _prefix, cid, rest = parts[0], parts[1], parts[2]
         with self.lock:
-            conn = next((dict(c) for c in self.connections if c["id"] == cid and c.get("enabled")), None)
+            # A command queued for a host that was edited meanwhile is dropped, not sent to the new host.
+            conn = self._conn_for(cid, gen)
             wled_fx = list(self.wled_effects.get(cid, []))
             shelly_meta = dict(self.shelly_meta.get(rid, {}))
             lifx_st = dict(self.lifx_state.get(cid, {}))
@@ -2345,13 +2343,20 @@ class ProviderManager:
                     expected_fp=expected_fp,
                 )
 
-    def recall_scene(self, rid):
+    def _conn_for(self, cid, gen):
+        """Enabled connection `cid` as a copy, only while it still has generation `gen` (None: any).
+        Caller holds self.lock, so the check and the choice of host happen together."""
+        if gen is not None and self.conn_generations.get(cid, 0) != gen:
+            return None
+        return next((dict(c) for c in self.connections if c["id"] == cid and c.get("enabled")), None)
+
+    def recall_scene(self, rid, gen=None):
         parts = rid.split(":", 2)
         if len(parts) < 3:
             return
         _prefix, cid, rest = parts[0], parts[1], parts[2]
         with self.lock:
-            conn = next((dict(c) for c in self.connections if c["id"] == cid and c.get("enabled")), None)
+            conn = self._conn_for(cid, gen)
             nano_map = dict(self.nanoleaf_scenes.get(cid, {}))
         if not conn:
             return
