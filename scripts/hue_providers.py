@@ -1514,6 +1514,8 @@ class ProviderManager:
         self.connections = []
         self.conn_generations = {}     # conn_id -> int (bumped on edit/toggle/remove)
         self.results = {}              # conn_id -> {"rooms", "sensors", "light_count", "on_count"}
+        self.results_gen = {}          # conn_id -> generation the current results were fetched under
+        self._save_lock = threading.Lock()  # one providers.json snapshot+write+replace at a time
         self.connected = {}            # conn_id -> bool
         self.errors = {}               # conn_id -> str
         self.wled_effects = {}         # conn_id -> [str]
@@ -1621,19 +1623,30 @@ class ProviderManager:
     def save(self):
         if self._load_blocked:
             raise ProviderError(self.load_warning or "Could not load providers.json — refusing to overwrite.")
-        self._ensure_private_dir()
-        with self.lock:
-            payload = {"version": 1, "providers": list(self.connections)}
-        data = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
-        path = self._path()
-        tmp = os.path.join(self.config_dir, f".providers.{os.getpid()}.{secrets.token_hex(4)}.tmp")
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        try:
-            os.write(fd, data)
-            os.fsync(fd)
-        finally:
+        # Snapshot, write and replace as one step, so a slower save of older state (e.g. a poll
+        # thread pinning a certificate) can never replace a newer one. Lock order: _save_lock, then lock.
+        with self._save_lock:
+            self._ensure_private_dir()
+            with self.lock:
+                payload = {"version": 1, "providers": copy.deepcopy(self.connections)}
+            data = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
+            path = self._path()
+            tmp = os.path.join(self.config_dir, f".providers.{os.getpid()}.{secrets.token_hex(4)}.tmp")
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+            try:
+                view = memoryview(data)
+                while view:
+                    view = view[os.write(fd, view):]
+                os.fsync(fd)
+            except BaseException:
+                os.close(fd)
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
             os.close(fd)
-        os.replace(tmp, path)
+            os.replace(tmp, path)
 
     def secrets(self):
         with self.lock:
@@ -1763,6 +1776,7 @@ class ProviderManager:
                 self.connections.append(clean_c)
             self.conn_generations[clean_c["id"]] = self.conn_generations.get(clean_c["id"], 0) + 1
             self._drop_pending_for(clean_c["id"])
+            self._forget_device_state(clean_c["id"])
             self.errors.pop(clean_c["id"], None)
             self._fail_counts.pop(clean_c["id"], None)
             self._next_poll_at.pop(clean_c["id"], None)
@@ -1779,14 +1793,8 @@ class ProviderManager:
             self.connections = [c for c in self.connections if c["id"] != cid]
             self.conn_generations[cid] = self.conn_generations.get(cid, 0) + 1
             self._drop_pending_for(cid)
-            self.results.pop(cid, None)
-            self.connected.pop(cid, None)
+            self._forget_device_state(cid)
             self.errors.pop(cid, None)
-            self.wled_effects.pop(cid, None)
-            self.nanoleaf_scenes.pop(cid, None)
-            self.lifx_state.pop(cid, None)
-            self.shelly_meta = {k: v for k, v in self.shelly_meta.items() if not k.startswith(f"shelly:{cid}:")}
-            self.dirigera_kelvin = {k: v for k, v in self.dirigera_kelvin.items() if not k.startswith(f"dirigera:{cid}:")}
         self.save()
 
     def toggle_connection(self, cid, enabled):
@@ -1860,6 +1868,17 @@ class ProviderManager:
         parts = str(rid or "").split(":", 2)
         return parts[1] if len(parts) >= 2 else ""
 
+    def _forget_device_state(self, cid):
+        """Drop everything learned from a connection's previous target (caller holds self.lock)."""
+        self.results.pop(cid, None)
+        self.results_gen.pop(cid, None)
+        self.connected.pop(cid, None)
+        self.wled_effects.pop(cid, None)
+        self.nanoleaf_scenes.pop(cid, None)
+        self.lifx_state.pop(cid, None)
+        self.shelly_meta = {k: v for k, v in self.shelly_meta.items() if not k.startswith(f"shelly:{cid}:")}
+        self.dirigera_kelvin = {k: v for k, v in self.dirigera_kelvin.items() if not k.startswith(f"dirigera:{cid}:")}
+
     def _drop_pending_for(self, cid):
         """Forget queued commands of one connection (caller holds self.lock): after an edit, a
         toggle or a removal they must never reach the new or a removed host."""
@@ -1871,7 +1890,11 @@ class ProviderManager:
             key = (kind, rid)
             if key not in self._pending_cmds and len(self._pending_cmds) >= MAX_PENDING_EXTRA:
                 return False
-            gen = self.conn_generations.get(self._rid_conn_id(rid), 0)
+            cid = self._rid_conn_id(rid)
+            gen = self.conn_generations.get(cid, 0)
+            if self.results_gen.get(cid) != gen:
+                # The light/scene was learned from an earlier target (or not yet from this one).
+                return False
             prev = self._pending_cmds.get(key)
             merged = dict(prev[1]) if prev and prev[0] == gen else {}
             merged.update(body)
@@ -2146,6 +2169,7 @@ class ProviderManager:
                     self.errors[cid] = ""
                     return
                 self.results[cid] = {"rooms": rooms, "sensors": sensors, "light_count": lcount, "on_count": ocount}
+                self.results_gen[cid] = gen
                 self.connected[cid] = True
                 self.errors[cid] = ""
             else:

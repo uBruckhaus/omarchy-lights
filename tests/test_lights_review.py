@@ -97,6 +97,7 @@ class PendingCommandTests(unittest.TestCase):
                                  "name": "Strip", "room_name": "", "token": "", "use_https": False,
                                  "enabled": True, "cert_fingerprint": ""}]
         self.mgr.conn_generations = {"c1": 1}
+        self.mgr.results_gen = {"c1": 1}
         self.sent = []
         real_set_light = self.mgr.set_light
 
@@ -164,6 +165,41 @@ class PendingCommandTests(unittest.TestCase):
             t.join(3)
         self.assertEqual(order, ["sent", "removed"])
 
+    def test_lights_from_previous_target_are_not_commandable(self):
+        self.mgr.save = lambda: None
+        self.mgr.results["c1"] = {"rooms": [], "sensors": [], "light_count": 1, "on_count": 0}
+        edited = dict(self.mgr.connections[0], host="192.168.1.99")
+        with mock.patch.object(self.mgr, "_resolve_saved_or_paired_secret", return_value=edited):
+            self.mgr.save_connection(edited)
+        self.assertNotIn("c1", self.mgr.results)
+        self.assertFalse(self.mgr.queue_command("light", "wled:c1:0", {"on": {"on": True}}))
+        self.assertFalse(self.mgr._drain_pending())
+        self.assertEqual(self.sent, [])
+
+    def test_concurrent_saves_are_serialized(self):
+        import time
+        mgr = prov.ProviderManager(self.dir)
+        mgr.connections = [dict(self.mgr.connections[0])]
+        inside, peak = [0], [0]
+        real_replace = os.replace
+
+        def slow_replace(a, b):
+            inside[0] += 1
+            peak[0] = max(peak[0], inside[0])
+            time.sleep(0.05)
+            inside[0] -= 1
+            return real_replace(a, b)
+
+        with mock.patch.object(prov.os, "replace", side_effect=slow_replace):
+            ts = [threading.Thread(target=mgr.save) for _ in range(4)]
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join(5)
+        self.assertEqual(peak[0], 1)
+        with open(os.path.join(self.dir, "providers.json")) as fh:
+            self.assertEqual(json.load(fh)["providers"][0]["id"], "c1")
+
     def test_unknown_ids_share_one_lock(self):
         for i in range(50):
             self.mgr._send_lock("x%d" % i)
@@ -174,6 +210,39 @@ class PendingCommandTests(unittest.TestCase):
         self.mgr.remove_connection("c1")
         self.assertFalse(self.mgr._drain_pending())
         self.assertEqual(self.sent, [])
+
+
+class ProviderActionGateTests(unittest.TestCase):
+    def test_only_one_test_or_pair_thread_at_a_time(self):
+        h = hue.Hue.__new__(hue.Hue)
+        h._provider_action_gate = threading.Lock()
+        release = threading.Event()
+        calls = []
+
+        class Mgr:
+            last_action = {}
+
+            def test_connection(self, raw):
+                calls.append(raw)
+                release.wait(3)
+                return "ok"
+
+        h.providers_mgr = Mgr()
+        h._providers_mod = prov
+        h.emit = lambda: None
+        h.redact = lambda t: t
+        for _ in range(20):
+            h.handle({"cmd": "test_provider", "provider": {}})
+        h.handle({"cmd": "pair_provider", "kind": "nanoleaf", "host": "192.168.1.9", "port": "x"})
+        h.handle({"cmd": "pair_provider", "kind": "nanoleaf", "host": "192.168.1.9", "port": 99999})
+        release.set()
+        import time
+        for _ in range(50):
+            if not h._provider_action_gate.locked():
+                break
+            time.sleep(0.02)
+        self.assertEqual(len(calls), 1)
+        self.assertFalse(h._provider_action_gate.locked())
 
 
 class HomeAssistantPinTests(unittest.TestCase):

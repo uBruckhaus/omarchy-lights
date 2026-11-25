@@ -5029,6 +5029,7 @@ class Hue:
         self.sse_wake = threading.Event()
         self._stop = threading.Event()
         self._sse_sock = None
+        self._provider_action_gate = threading.Lock()
         self.config = load_config()
         self.panel_open = False
         self.rooms = []
@@ -7478,6 +7479,9 @@ class Hue:
                 threading.Thread(target=_disc_providers, daemon=True).start()
         elif name == "test_provider" and self.providers_mgr:
             raw_prov = cmd.get("provider")
+            # One device test or pairing at a time: repeated commands never pile up threads.
+            if not self._provider_action_gate.acquire(blocking=False):
+                return
             self.providers_mgr.last_action = {"running": True, "kind": "test", "ok": False, "message": "", "pair_id": ""}
             self.emit()
             def _test_prov():
@@ -7486,15 +7490,24 @@ class Hue:
                     self.providers_mgr.last_action = {"running": False, "kind": "test", "ok": True, "message": self.redact(summary)[:160], "pair_id": ""}
                 except Exception as exc:  # noqa: BLE001
                     self.providers_mgr.last_action = {"running": False, "kind": "test", "ok": False, "message": self.redact(str(exc))[:160], "pair_id": ""}
+                finally:
+                    self._provider_action_gate.release()
                 self.emit()
-            threading.Thread(target=_test_prov, daemon=True).start()
+            self._start_provider_action(_test_prov)
         elif name == "pair_provider" and self.providers_mgr and self._providers_mod:
             pkind = str(cmd.get("kind") or "").lower()
             phost = str(cmd.get("host") or "").strip()
             pport = cmd.get("port")
             if pkind not in ("nanoleaf", "dirigera"):
                 return
-            eff_port = int(pport or (16021 if pkind == "nanoleaf" else 8443))
+            try:
+                eff_port = int(pport or (16021 if pkind == "nanoleaf" else 8443))
+            except (TypeError, ValueError):
+                return
+            if not 1 <= eff_port <= 65535:
+                return
+            if not self._provider_action_gate.acquire(blocking=False):
+                return
             self.providers_mgr.last_action = {"running": True, "kind": f"pair_{pkind}", "ok": False, "message": "", "pair_id": ""}
             self.emit()
             def _pair_prov():
@@ -7508,8 +7521,19 @@ class Hue:
                     self.providers_mgr.last_action = {"running": False, "kind": f"pair_{pkind}", "ok": True, "message": "Paired", "pair_id": pair_id}
                 except Exception as exc:  # noqa: BLE001
                     self.providers_mgr.last_action = {"running": False, "kind": f"pair_{pkind}", "ok": False, "message": self.redact(str(exc))[:160], "pair_id": ""}
+                finally:
+                    self._provider_action_gate.release()
                 self.emit()
-            threading.Thread(target=_pair_prov, daemon=True).start()
+            self._start_provider_action(_pair_prov)
+
+    def _start_provider_action(self, fn):
+        """Start a gated provider action; if the thread cannot start, free the gate again."""
+        try:
+            threading.Thread(target=fn, daemon=True).start()
+        except RuntimeError:
+            self._provider_action_gate.release()
+            self.providers_mgr.last_action = {"running": False, "kind": "", "ok": False, "message": "", "pair_id": ""}
+            self.emit()
 
     # -- loops
     def worker(self):
