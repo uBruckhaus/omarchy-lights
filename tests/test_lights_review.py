@@ -278,6 +278,37 @@ class HttpDeadlineTests(unittest.TestCase):
         srv.close()
 
 
+    def test_dripping_body_after_connection_close_is_cut(self):
+        import socket as _s
+        import time
+        srv = _s.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        port = srv.getsockname()[1]
+        stop = threading.Event()
+
+        def drip():
+            c, _ = srv.accept()
+            try:
+                c.recv(4096)
+                c.sendall(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n")
+                while not stop.is_set():
+                    c.sendall(b"x")
+                    time.sleep(0.2)
+            except OSError:
+                pass
+            finally:
+                c.close()
+
+        threading.Thread(target=drip, daemon=True).start()
+        start = time.monotonic()
+        with self.assertRaises((prov.ProviderError, OSError)):
+            prov._http_request("127.0.0.1", port, "GET", "/json", timeout=1.0, allow_loopback=True)
+        self.assertLess(time.monotonic() - start, 3.0)
+        stop.set()
+        srv.close()
+
+
 class RemoveAndTestIsolationTests(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp()

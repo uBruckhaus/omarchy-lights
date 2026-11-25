@@ -517,10 +517,11 @@ def _http_request(
     # Watchdog for the whole request: socket timeouts restart on every read, so a device that drips
     # header or body bytes could otherwise hold this thread far past `timeout`.
     expired = threading.Event()
+    sock_ref = []  # the connected socket: http.client drops conn.sock after "Connection: close" headers
 
     def _expire():
         expired.set()
-        sock = getattr(conn, "sock", None)
+        sock = sock_ref[0] if sock_ref else getattr(conn, "sock", None)
         if sock is not None:
             try:
                 sock.shutdown(socket.SHUT_RDWR)
@@ -532,6 +533,7 @@ def _http_request(
     watchdog.start()
     try:
         conn.connect()
+        sock_ref.append(conn.sock)
         if use_https:
             der = conn.sock.getpeercert(binary_form=True)
             if not der:
