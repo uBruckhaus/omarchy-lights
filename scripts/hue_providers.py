@@ -514,6 +514,22 @@ def _http_request(
     else:
         conn = http.client.HTTPConnection(ip, int(port), timeout=timeout)
 
+    # Watchdog for the whole request: socket timeouts restart on every read, so a device that drips
+    # header or body bytes could otherwise hold this thread far past `timeout`.
+    expired = threading.Event()
+
+    def _expire():
+        expired.set()
+        sock = getattr(conn, "sock", None)
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+    watchdog = threading.Timer(max(0.0, deadline - time.monotonic()), _expire)
+    watchdog.daemon = True
+    watchdog.start()
     try:
         conn.connect()
         if use_https:
@@ -546,8 +562,15 @@ def _http_request(
             if total > max_body:
                 raise ProviderError("Response too large.")
             chunks.append(chunk)
+        if expired.is_set():
+            raise ProviderError("Response timed out.")
         return resp.status, b"".join(chunks)
+    except (OSError, http.client.HTTPException, ValueError) as exc:
+        if expired.is_set():
+            raise ProviderError("Request timed out.") from exc
+        raise
     finally:
+        watchdog.cancel()
         try:
             conn.close()
         except OSError:
@@ -1749,6 +1772,11 @@ class ProviderManager:
         clean_c = self._resolve_saved_or_paired_secret(raw, consume_pair=True)
         if not clean_c:
             raise ProviderError("Invalid device configuration (check local IP / host).")
+        with self.lock:
+            if not any(c["id"] == clean_c["id"] for c in self.connections):
+                # A new device never reuses an ID the panel names: IDs (and their generations) of
+                # removed devices are never seen again.
+                clean_c["id"] = uuid.uuid4().hex[:12]
         with self._send_lock(clean_c["id"]):
             return self._save_connection_unlocked(clean_c)
 
@@ -1790,11 +1818,17 @@ class ProviderManager:
 
     def _remove_connection_unlocked(self, cid):
         with self.lock:
+            if not any(c["id"] == cid for c in self.connections):
+                return False  # unknown ID from the panel: nothing to change, nothing remembered
             self.connections = [c for c in self.connections if c["id"] != cid]
-            self.conn_generations[cid] = self.conn_generations.get(cid, 0) + 1
             self._drop_pending_for(cid)
             self._forget_device_state(cid)
+            # IDs are never reused (save_connection), so all per-ID bookkeeping can go.
+            self.conn_generations.pop(cid, None)
+            self._send_locks.pop(cid, None)
             self.errors.pop(cid, None)
+            self._fail_counts.pop(cid, None)
+            self._next_poll_at.pop(cid, None)
         self.save()
 
     def toggle_connection(self, cid, enabled):
@@ -1972,7 +2006,9 @@ class ProviderManager:
             pass
         return {}
 
-    def fetch_single(self, conn, gen=None):
+    def fetch_single(self, conn, gen=None, commit=True):
+        """Fetch one device. Learned metadata (effects, scenes, meta) is kept only when `commit` and
+        the connection still has generation `gen`, so tests and stale polls never overwrite it."""
         kind = conn["kind"]
         host, port = conn["host"], conn["port"]
         token = conn.get("token", "")
@@ -2021,7 +2057,8 @@ class ProviderManager:
                 pass
             rooms, sensors, effects = parse_wled(conn, data, presets)
             with self.lock:
-                self.wled_effects[conn["id"]] = effects
+                if commit and self._gen_current(conn["id"], gen):
+                    self.wled_effects[conn["id"]] = effects
             return rooms, sensors
 
         if kind == "wiz":
@@ -2037,7 +2074,8 @@ class ProviderManager:
             if not decoded:
                 raise ProviderError("No LAN response from LIFX device.")
             with self.lock:
-                self.lifx_state[conn["id"]] = decoded
+                if commit and self._gen_current(conn["id"], gen):
+                    self.lifx_state[conn["id"]] = decoded
             return lifx_to_rooms(conn, decoded)
 
         if kind == "govee":
@@ -2067,7 +2105,8 @@ class ProviderManager:
             data = json.loads(raw.decode("utf-8"))
             rooms, sensors, scene_map = parse_nanoleaf(conn, data)
             with self.lock:
-                self.nanoleaf_scenes[conn["id"]] = scene_map
+                if commit and self._gen_current(conn["id"], gen):
+                    self.nanoleaf_scenes[conn["id"]] = scene_map
             return rooms, sensors
 
         if kind == "shelly":
@@ -2082,7 +2121,8 @@ class ProviderManager:
                     if 200 <= s2 < 300:
                         rooms, sensors, meta_map = parse_shelly_gen2(conn, json.loads(r1.decode("utf-8")), json.loads(r2.decode("utf-8")))
                         with self.lock:
-                            self.shelly_meta.update(meta_map)
+                            if commit and self._gen_current(conn["id"], gen):
+                                self.shelly_meta.update(meta_map)
                         return rooms, sensors
             except ProviderError:
                 raise
@@ -2095,7 +2135,8 @@ class ProviderManager:
                 raise ProviderError(f"Shelly HTTP {st}")
             rooms, sensors, meta_map = parse_shelly_gen1(conn, json.loads(raw.decode("utf-8")))
             with self.lock:
-                self.shelly_meta.update(meta_map)
+                if commit and self._gen_current(conn["id"], gen):
+                    self.shelly_meta.update(meta_map)
             return rooms, sensors
 
         if kind == "dirigera":
@@ -2125,7 +2166,8 @@ class ProviderManager:
                 pass
             rooms, sensors, k_bounds = parse_dirigera(conn, devices, raw_scenes)
             with self.lock:
-                self.dirigera_kelvin.update(k_bounds)
+                if commit and self._gen_current(conn["id"], gen):
+                    self.dirigera_kelvin.update(k_bounds)
             return rooms, sensors
 
         raise ProviderError(f"Unknown provider: {kind}")
@@ -2135,7 +2177,9 @@ class ProviderManager:
         if not clean_c:
             raise ProviderError("Invalid host or configuration.")
         try:
-            rooms, _sensors = self.fetch_single(clean_c)
+            # commit=False: a test (maybe of an edited, unsaved host under a saved ID) never
+            # touches the saved connection's cached effects, scenes or device metadata.
+            rooms, _sensors = self.fetch_single(clean_c, commit=False)
         except Exception as exc:  # noqa: BLE001
             redacted = self.redact(str(exc), extra_secrets={clean_c.get("token", "")})
             raise ProviderError(friendly_provider_error(redacted)) from exc
@@ -2390,6 +2434,10 @@ class ProviderManager:
                     timeout=4.5,
                     expected_fp=expected_fp,
                 )
+
+    def _gen_current(self, cid, gen):
+        """Caller holds self.lock. True when `gen` is None (direct call) or still current for `cid`."""
+        return gen is None or self.conn_generations.get(cid) == gen
 
     def _send_lock(self, cid):
         """Per-connection send/edit lock. Only saved connections get their own lock (the panel can

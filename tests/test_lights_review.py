@@ -245,6 +245,95 @@ class ProviderActionGateTests(unittest.TestCase):
         self.assertFalse(h._provider_action_gate.locked())
 
 
+class HttpDeadlineTests(unittest.TestCase):
+    def test_dripping_server_is_cut_at_the_deadline(self):
+        import socket as _s
+        import time
+        srv = _s.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        port = srv.getsockname()[1]
+        stop = threading.Event()
+
+        def drip():
+            c, _ = srv.accept()
+            try:
+                c.recv(4096)
+                c.sendall(b"HTTP/1.1 200 OK\r\n")
+                while not stop.is_set():
+                    c.sendall(b"X-A: b\r\n")
+                    time.sleep(0.2)
+            except OSError:
+                pass
+            finally:
+                c.close()
+
+        t = threading.Thread(target=drip, daemon=True)
+        t.start()
+        start = time.monotonic()
+        with self.assertRaises((prov.ProviderError, OSError)):
+            prov._http_request("127.0.0.1", port, "GET", "/api/states", timeout=1.0, allow_loopback=True)
+        self.assertLess(time.monotonic() - start, 3.0)
+        stop.set()
+        srv.close()
+
+
+class RemoveAndTestIsolationTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        os.chmod(self.dir, 0o700)
+        self.mgr = prov.ProviderManager(self.dir)
+        self.mgr.connections = [{"id": "c1", "kind": "wled", "host": "192.168.1.20", "port": 80,
+                                 "name": "Strip", "room_name": "", "token": "", "use_https": False,
+                                 "enabled": True, "cert_fingerprint": ""}]
+        self.mgr.conn_generations = {"c1": 1}
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_unknown_ids_leave_no_state(self):
+        for i in range(100):
+            self.assertFalse(self.mgr.remove_connection("ghost%d" % i))
+        self.assertEqual(set(self.mgr.conn_generations), {"c1"})
+        self.assertFalse(os.path.exists(os.path.join(self.dir, "providers.json")))
+
+    def test_removed_device_state_is_released(self):
+        self.mgr._send_lock("c1")
+        self.mgr.remove_connection("c1")
+        self.assertNotIn("c1", self.mgr.conn_generations)
+        self.assertNotIn("c1", self.mgr._send_locks)
+
+    def test_new_devices_never_reuse_a_panel_id(self):
+        self.mgr.save = lambda: None
+        raw = dict(self.mgr.connections[0], id="c9", host="192.168.1.30")
+        with mock.patch.object(self.mgr, "_resolve_saved_or_paired_secret", return_value=dict(raw)):
+            saved = self.mgr.save_connection(raw)
+        self.assertNotEqual(saved["id"], "c9")
+
+    def test_connection_test_does_not_touch_saved_caches(self):
+        self.mgr.wled_effects["c1"] = ["Solid", "Rainbow"]
+        other = dict(self.mgr.connections[0], host="192.168.1.77")
+        reply = json.dumps({"state": {"on": True, "bri": 100, "seg": []}, "info": {"name": "Other"},
+                            "effects": ["Solid", "Fire"]}).encode()
+        with mock.patch.object(self.mgr, "_resolve_saved_or_paired_secret", return_value=other), \
+                mock.patch.object(prov, "_http_request", return_value=(200, reply)):
+            try:
+                self.mgr.test_connection(other)
+            except prov.ProviderError:
+                pass
+        self.assertEqual(self.mgr.wled_effects["c1"], ["Solid", "Rainbow"])
+
+    def test_stale_poll_does_not_write_caches(self):
+        reply = json.dumps({"state": {"on": True, "bri": 100, "seg": []}, "info": {"name": "S"},
+                            "effects": ["Solid", "Fire"]}).encode()
+        with mock.patch.object(prov, "_http_request", return_value=(200, reply)):
+            try:
+                self.mgr.fetch_single(dict(self.mgr.connections[0]), gen=0)  # generation already moved on
+            except Exception:
+                pass
+        self.assertNotIn("c1", self.mgr.wled_effects)
+
+
 class HomeAssistantPinTests(unittest.TestCase):
     def test_area_request_uses_fingerprint_captured_by_first_request(self):
         mgr = prov.ProviderManager(tempfile.mkdtemp())
