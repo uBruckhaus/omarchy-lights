@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "ubruckhaus.lights",
+  "name": "Lights",
+  "version": "1.0.0",
+  "author": "uBruckhaus",
+  "description": "Local smart lights from your bar: Philips Hue, Home Assistant, WLED, WiZ, LIFX, Govee, Nanoleaf, Shelly & IKEA DIRIGERA. Floorplan Studio with polygon rooms, floors and a lighting planner, scenes, colors, Light Themes, schedules, rules and Audio Synth. No cloud.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Lights",
+    "description": "Smart lights from Hue, Home Assistant, WLED, WiZ, LIFX, Govee, Nanoleaf, Shelly and IKEA",
+    "category": "System",
+    "defaultSection": "right",
+    "allowMultiple": false
+  },
+  "license": "MIT"
+}

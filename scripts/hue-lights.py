@@ -1,0 +1,7683 @@
+#!/usr/bin/env python3
+"""Philips Hue bridge helper for the Hue Lights Omarchy plugin.
+
+Long-running process: reads one JSON command per line on stdin and prints one
+JSON snapshot per line on stdout. Talks to the bridge's local CLIP v2 API over
+HTTPS only. The bridge certificate is self-signed by Philips, so it is pinned
+(SHA-256 fingerprint + CN == bridge id) when pairing and checked on every
+connection afterwards. The application key lives in
+$XDG_CONFIG_HOME/omarchy/hue-lights/config.json (~/.config/omarchy/hue-lights,
+mode 0600) and never leaves this process.
+"""
+
+import atexit
+import fcntl
+import hashlib
+import http.client
+import importlib.util
+import ipaddress
+import json
+import math
+import os
+import re
+import select
+import shutil
+import signal
+import socket
+import ssl
+import stat
+import struct
+import tempfile
+import subprocess
+import sys
+import threading
+import time
+import uuid
+
+def _config_home():
+    """$XDG_CONFIG_HOME when it is an absolute path (the spec ignores relative ones), else ~/.config."""
+    home = os.environ.get("XDG_CONFIG_HOME", "")
+    return home if os.path.isabs(home) else os.path.join(os.path.expanduser("~"), ".config")
+
+
+CONFIG_DIR = os.path.join(_config_home(), "omarchy", "hue-lights")
+CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
+
+POLL_OPEN = 2.0       # seconds between refreshes while the panel is open
+POLL_CLOSED = 20.0    # seconds between refreshes while it is closed
+PAIR_WINDOW = 35.0    # how long to keep asking for a key after "pair"
+LIGHT_INTERVAL = 0.12 # Hue guidance: ~10 light commands per second
+GROUP_INTERVAL = 0.6  # ... and ~1 group command per second
+HTTP_TIMEOUT = 4.0     # overall deadline per request: connect, TLS, headers and body
+# The bridge always listens on 443. HUE_LIGHTS_BRIDGE_PORT exists for the test harness's
+# mock bridge (tools/mock-bridge.py), which cannot bind 443 without root.
+try:
+    BRIDGE_PORT = int(os.environ.get("HUE_LIGHTS_BRIDGE_PORT", "443"))
+except ValueError:
+    BRIDGE_PORT = 443
+if not 1 <= BRIDGE_PORT <= 65535:
+    BRIDGE_PORT = 443
+MAX_BODY = 4 * 1024 * 1024
+MAX_CONFIG = 64 * 1024
+MAX_PENDING = 256     # queued light/group/scene commands at most (one per resource)
+MAX_COMMAND = 64 * 1024  # bytes per panel command line; longer lines are dropped unread
+# Rooms and zones name their lights directly or through devices, and nothing stops
+# a bridge from repeating them: each group keeps a light once and at most
+# MAX_GROUP_LIGHTS of them, all groups together at most MAX_MEMBERSHIPS. The lights
+# in no room ("Other lights") are a group like the others: the same two limits.
+MAX_GROUP_LIGHTS = 150
+MAX_MEMBERSHIPS = 1000
+# Each room or zone ID is shown once. Scenes are kept once per ID, at most
+# MAX_GROUP_SCENES per group and MAX_SCENES on the whole bridge, and every scene
+# goes to the one group it names, so the model never holds more than MAX_SCENES.
+MAX_GROUP_SCENES = 100
+MAX_SCENES = 1000
+MAX_SCHEDULES = 100
+MAX_LOCAL_SCHEDULES = 50
+MAX_THEMES = 40
+MAX_RULES = 100
+MAX_RULE_TARGETS = 16
+MAX_RULE_LOG = 20
+MAX_API_QUEUE = 64
+MAX_EFFECTS = 64
+MAX_ENTERTAINMENT_AREAS = 32
+MAX_MOTION_AREAS = 64
+MAX_SENSORS = 128
+MAX_FLOORPLAN_BOXES = 40
+MAX_FLOORPLAN_STAMPS = 80
+MAX_FLOORPLAN_LAMPS = 120
+MAX_FLOORPLAN_SENSORS = 128
+MAX_FLOORPLAN_BG_BYTES = 15 * 1024 * 1024
+FLOORPLAN_VERSION = 1
+FLOORPLAN_VERSIONS = (1, 2)
+FLOORPLAN_TEMPLATES = (
+    "auto_bridge", "studio_loft", "one_bed_apt", "three_room_apt", "family_house", "desk_studio", "bungalow_l_shape",
+)
+FLOORPLAN_STAMP_KINDS = ("door", "window", "sofa", "tv", "desk", "bed", "dining", "kitchen", "stairs")
+MAX_FLOORPLAN_FLOORS = 12
+MAX_FLOORPLAN_PLANNED = 120
+MAX_FLOORPLAN_POLYGON_PTS = 32
+FLOOR_ID_RE = re.compile(r"^[a-z0-9_-]{1,24}$")
+FLOORPLAN_STAMP_ROTS = (0, 90, 180, 270)
+FLOORPLAN_BG_FITS = ("contain", "cover")
+FLOORPLAN_BG_EXTS = (".png", ".jpg", ".jpeg", ".webp")
+FLOORPLAN_BG_PREFIX = "floorplan_bg."
+MANAGED_FLOORPLAN_BG_NAMES = frozenset({
+    FLOORPLAN_BG_PREFIX + "png",
+    FLOORPLAN_BG_PREFIX + "jpg",
+    FLOORPLAN_BG_PREFIX + "webp",
+})
+MAX_FLOORPLAN_BG_DIM = 16384
+MAX_FLOORPLAN_BG_PIXELS = 64 * 1024 * 1024
+LAMP_ICONS = (
+    "bulb", "spot", "strip", "floor", "table", "pendant",
+    "ceiling", "wall", "bar", "desk", "outdoor", "candle",
+)
+_LAMP_ICON_ALIASES = {
+    "floor_lamp": "floor",
+    "table_lamp": "table",
+    "desk_lamp": "desk",
+    "wall_lamp": "wall",
+    "ceiling_lamp": "ceiling",
+    "pendant_lamp": "pendant",
+    "lightstrip": "strip",
+    "spotlight": "spot",
+}
+HUE_ARCHETYPES = frozenset({
+    "living_room", "kitchen", "dining", "bedroom", "kids_bedroom",
+    "bathroom", "nursery", "recreation", "office", "gym", "hallway",
+    "toilet", "front_door", "garage", "terrace", "garden", "driveway",
+    "carport", "home", "downstairs", "upstairs", "top_floor", "attic",
+    "guest_room", "staircase", "lounge", "man_cave", "computer", "studio",
+    "music", "tv", "reading", "closet", "storage", "laundry_room",
+    "balcony", "porch", "barbecue", "pool", "other",
+})
+RULE_ECHO_WINDOW = 1.5
+RULE_COOLDOWN = 2.0
+MAX_CASCADE_DEPTH = 3
+SSE_BACKOFF = (2.0, 5.0, 15.0, 30.0)
+SSE_READ_TIMEOUT = 15.0
+LOCAL_SCHEDULE_POLL_CAP = 15.0
+DEFAULT_SCHEDULE_SCRIPT_ID = "7e571ac6-f363-42e1-809a-49656328a7a7"
+
+UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+BRIDGE_ID_RE = re.compile(r"^[0-9A-F]{16}$")
+APP_KEY_RE = re.compile(r"[A-Za-z0-9_-]{1,100}")     # the bridge's application key ("username")
+CLIENT_KEY_RE = re.compile(r"[0-9A-Fa-f]{1,64}")    # the entertainment client key
+EFFECT_RE = re.compile(r"^[a-z0-9_]{1,32}$")
+TIME_HHMM_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
+THEME_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+FLOORPLAN_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+FLOORPLAN_ICON_RE = re.compile(r"^[a-z0-9_]{1,24}$")
+HEX_COLOR_RE = re.compile(r"^#?[0-9a-fA-F]{6}$")
+DAY_SHORT_TO_FULL = {
+    "mon": "monday", "tue": "tuesday", "wed": "wednesday",
+    "thu": "thursday", "fri": "friday", "sat": "saturday", "sun": "sunday",
+}
+DAY_FULL_TO_SHORT = {v: k for k, v in DAY_SHORT_TO_FULL.items()}
+DAY_ORDER = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+RULE_KINDS = ("follow", "exclusive", "companion", "desktop", "sensor")
+SCHEDULE_MODES = ("bridge", "local")
+MAX_SECRETS = 8
+
+BUILTIN_THEMES = [
+    {"id": "reading", "name": "Reading", "hex": "#ffd9a0", "mirek": 320, "bri": 85, "effect": "no_effect", "built_in": True},
+    {"id": "relax", "name": "Relax", "hex": "#ffb86b", "mirek": 420, "bri": 55, "effect": "no_effect", "built_in": True},
+    {"id": "focus", "name": "Focus", "hex": "#e8f2ff", "mirek": 210, "bri": 100, "effect": "no_effect", "built_in": True},
+    {"id": "sunset", "name": "Sunset Glow", "hex": "#ff6b35", "mirek": None, "bri": 70, "effect": "no_effect", "built_in": True},
+    {"id": "ocean", "name": "Deep Ocean", "hex": "#1e88e5", "mirek": None, "bri": 65, "effect": "no_effect", "built_in": True},
+    {"id": "cyberpunk", "name": "Cyberpunk", "hex": "#ff2e93", "mirek": None, "bri": 85, "effect": "no_effect", "built_in": True},
+    {"id": "fireplace", "name": "Fireplace", "hex": "#ff7b29", "mirek": 450, "bri": 60, "effect": "candle", "built_in": True},
+    {"id": "nightlight", "name": "Nightlight", "hex": "#ff9e44", "mirek": 500, "bri": 12, "effect": "no_effect", "built_in": True},
+]
+BUILTIN_THEME_IDS = frozenset(t["id"] for t in BUILTIN_THEMES)
+
+SYNTH_SOURCES = ("system", "mic", "demo")
+SYNTH_MODES = ("club", "chill", "ambient", "strobe")
+SYNTH_BANDS = ("all", "bass", "mids", "treble")
+SYNTH_PALETTES = {
+    "neon": ("#ff007f", "#00f5ff", "#8a2be2", "#39ff14"),
+    "sunset": ("#ff4e50", "#fc913a", "#f9d423", "#c94b4b"),
+    "ocean": ("#005c97", "#00b4db", "#38ef7d", "#1e3c72"),
+    "aurora": ("#00f260", "#0575e6", "#7f00ff", "#00d2ff"),
+    "fire": ("#ff1e00", "#ff6a00", "#ffb300", "#ff3d00"),
+    "pastel": ("#ffb3ba", "#bae1ff", "#baffc9", "#e0bbff"),
+}
+SYNTH_LIGHT_INTERVAL = 0.22
+SYNTH_EMIT_OPEN = 0.10
+SYNTH_EMIT_CLOSED = 0.50
+SYNTH_BASS_FREQS = (60.0, 100.0, 150.0)
+SYNTH_MIDS_FREQS = (400.0, 800.0, 1500.0)
+SYNTH_TREBLE_FREQS = (3000.0, 5000.0, 7000.0)
+
+
+# ---------------------------------------------------------------------------
+# Pure helpers (unit tested)
+
+def valid_uuid(value):
+    return isinstance(value, str) and UUID_RE.match(value) is not None
+
+
+def valid_bridge_ip(value):
+    """Only private / link-local IPv4 literals: the bridge is always on the LAN."""
+    try:
+        ip = ipaddress.IPv4Address(str(value))
+    except (ipaddress.AddressValueError, ValueError):
+        return False
+    return ip.is_private and not ip.is_loopback and not ip.is_unspecified and not ip.is_multicast
+
+
+def clamp(value, low, high):
+    return max(low, min(high, value))
+
+
+def finite(value, default, low, high):
+    """A bridge or panel number as a float in [low, high]; `default` for NaN, infinities and junk
+    (json.loads accepts NaN/Infinity, which the panel's JSON.parse would reject)."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return clamp(number, low, high) if math.isfinite(number) else default
+
+
+def clean(text, limit=60):
+    """Names come from the bridge or mDNS: no markup or control characters ever reach Qt."""
+    text = "".join(ch for ch in str(text or "") if ch.isprintable() and ch not in "<>&")
+    return text.strip()[:limit]
+
+
+def fingerprint(der):
+    return hashlib.sha256(der).hexdigest()
+
+
+def _der_items(buf, pos, end):
+    """Yield (tag, content_start, content_end) for the DER items in buf[pos:end]."""
+    while pos < end:
+        tag = buf[pos]
+        length = buf[pos + 1]
+        pos += 2
+        if length & 0x80:
+            count = length & 0x7F
+            length = int.from_bytes(buf[pos:pos + count], "big")
+            pos += count
+        yield tag, pos, pos + length
+        pos += length
+
+
+def cert_common_name(der):
+    """Subject CN of a DER certificate (Certificate > TBSCertificate > subject)."""
+    try:
+        _, cert_start, cert_end = next(_der_items(der, 0, len(der)))
+        _, tbs_start, tbs_end = next(_der_items(der, cert_start, cert_end))
+        fields = list(_der_items(der, tbs_start, tbs_end))
+        if fields and fields[0][0] == 0xA0:  # explicit version
+            fields = fields[1:]
+        _, subj_start, subj_end = fields[4]   # serial, sigAlg, issuer, validity, subject
+        for _, set_start, set_end in _der_items(der, subj_start, subj_end):
+            for _, atv_start, atv_end in _der_items(der, set_start, set_end):
+                (_, oid_s, oid_e), (_, val_s, val_e) = list(_der_items(der, atv_start, atv_end))[:2]
+                if der[oid_s:oid_e] == b"\x55\x04\x03":
+                    return der[val_s:val_e].decode("utf-8", "replace")
+    except (StopIteration, IndexError, ValueError):
+        pass
+    return ""
+
+
+def _gamma(c):
+    c = clamp(c, 0.0, 1.0)
+    return 12.92 * c if c <= 0.0031308 else 1.055 * (c ** (1 / 2.4)) - 0.055
+
+
+def xy_to_hex(x, y):
+    """CIE xy (Hue colour) to an sRGB hex string at full brightness, for a swatch."""
+    x, y = finite(x, None, 0.0, 1.0), finite(y, None, 0.0, 1.0)
+    if x is None or y is None or y <= 0:
+        return "#ffd27a"
+    z = 1.0 - x - y
+    Y = 1.0
+    X = (Y / y) * x
+    Z = (Y / y) * z
+    r = X * 1.656492 - Y * 0.354851 - Z * 0.255038
+    g = -X * 0.707196 + Y * 1.655397 + Z * 0.036152
+    b = X * 0.051713 - Y * 0.121364 + Z * 1.011530
+    peak = max(r, g, b)
+    if peak > 1:
+        r, g, b = r / peak, g / peak, b / peak
+    return "#%02x%02x%02x" % tuple(int(round(_gamma(c) * 255)) for c in (r, g, b))
+
+
+def _inv_gamma(c):
+    c = clamp(c, 0.0, 1.0)
+    return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+
+
+def hex_to_xy(hex_str):
+    """Convert '#rrggbb' (or 'rrggbb') sRGB hex to Hue CIE [x, y] clamped to [0, 1], or None."""
+    if not isinstance(hex_str, str):
+        return None
+    s = hex_str.strip()
+    if not HEX_COLOR_RE.fullmatch(s):
+        return None
+    if s.startswith("#"):
+        s = s[1:]
+    r = _inv_gamma(int(s[0:2], 16) / 255.0)
+    g = _inv_gamma(int(s[2:4], 16) / 255.0)
+    b = _inv_gamma(int(s[4:6], 16) / 255.0)
+    # Wide RGB D65 matrix (inverse of xy_to_hex)
+    X = r * 0.664511 + g * 0.154324 + b * 0.162028
+    Y = r * 0.283881 + g * 0.668433 + b * 0.047685
+    Z = r * 0.000088 + g * 0.072310 + b * 0.986039
+    total = X + Y + Z
+    if total <= 0.0:
+        return [0.3127, 0.329]
+    x = clamp(X / total, 0.0, 1.0)
+    y = clamp(Y / total, 0.0, 1.0)
+    return [round(x, 4), round(y, 4)]
+
+
+def mirek_to_hex(mirek):
+    """Colour temperature (mirek) to an approximate sRGB hex (Tanner Helland fit)."""
+    mirek = finite(mirek, None, 1.0, 1000000.0)
+    if mirek is None:
+        return "#ffd27a"
+    kelvin = 1000000.0 / mirek
+    t = clamp(kelvin, 1000, 40000) / 100.0
+    import math
+    if t <= 66:
+        r = 255
+        g = 99.4708025861 * math.log(t) - 161.1195681661
+        b = 0 if t <= 19 else 138.5177312231 * math.log(t - 10) - 305.0447927307
+    else:
+        r = 329.698727446 * ((t - 60) ** -0.1332047592)
+        g = 288.1221695283 * ((t - 60) ** -0.0755148492)
+        b = 255
+    return "#%02x%02x%02x" % tuple(int(clamp(c, 0, 255)) for c in (r, g, b))
+
+
+def light_color(light):
+    ct = light.get("color_temperature") or {}
+    if ct.get("mirek_valid") and ct.get("mirek"):
+        return mirek_to_hex(ct["mirek"])
+    xy = (light.get("color") or {}).get("xy")
+    if xy:
+        return xy_to_hex(xy.get("x"), xy.get("y"))
+    if ct.get("mirek"):
+        return mirek_to_hex(ct["mirek"])
+    return "#ffd27a"
+
+
+def brightness(value):
+    """A bridge brightness in 0..100; anything else (a string, NaN, an infinity) makes the whole
+    reply one this app does not understand, rather than a value the panel cannot parse."""
+    number = finite(value, None, 0.0, 100.0)
+    if number is None:
+        raise ValueError("unexpected brightness")
+    return number
+
+
+def blend_colors(colors):
+    """Average of '#rrggbb' strings (the room's swatch), warm white when empty."""
+    rgb = [tuple(int(c[i:i + 2], 16) for i in (1, 3, 5)) for c in colors if re.fullmatch(r"#[0-9a-f]{6}", c or "")]
+    if not rgb:
+        return "#ffd27a"
+    return "#%02x%02x%02x" % tuple(int(round(sum(ch[i] for ch in rgb) / len(rgb))) for i in range(3))
+
+
+def build_model(resources):
+    """Turn the flat CLIP v2 /resource list into rooms -> lights / scenes."""
+    by_type = {}
+    for res in resources if isinstance(resources, list) else []:
+        if isinstance(res, dict):
+            by_type.setdefault(res.get("type"), []).append(res)
+    lights = {r["id"]: r for r in by_type.get("light", []) if valid_uuid(r.get("id"))}
+    grouped = {r["id"]: r for r in by_type.get("grouped_light", []) if valid_uuid(r.get("id"))}
+    devices = {r["id"]: r for r in by_type.get("device", []) if valid_uuid(r.get("id"))}
+    connectivity = {}
+    for zc in by_type.get("zigbee_connectivity", []):
+        owner = (zc.get("owner") or {}).get("rid")
+        if owner:
+            connectivity[owner] = zc.get("status") == "connected"
+    light_owner = {}
+    for did, device in devices.items():
+        for svc in device.get("services") or []:
+            if isinstance(svc, dict) and svc.get("rtype") == "light" and valid_uuid(svc.get("rid")):
+                light_owner.setdefault(svc["rid"], did)
+
+    def light_entry(light):
+        dimming = light.get("dimming") if isinstance(light.get("dimming"), dict) else {}
+        owner_obj = light.get("owner") if isinstance(light.get("owner"), dict) else {}
+        raw_owner = owner_obj.get("rid")
+        owner_id = raw_owner if valid_uuid(raw_owner) else light_owner.get(light["id"], "")
+        ct = light.get("color_temperature") if isinstance(light.get("color_temperature"), dict) else {}
+        schema = ct.get("mirek_schema") if isinstance(ct.get("mirek_schema"), dict) else {}
+        mirek_min = int(round(finite(schema.get("mirek_minimum"), 153.0, 153.0, 500.0)))
+        mirek_max = int(round(finite(schema.get("mirek_maximum"), 500.0, 153.0, 500.0)))
+        if mirek_min > mirek_max:
+            mirek_min, mirek_max = 153, 500
+        raw_mirek = ct.get("mirek")
+        mirek = None
+        if ct.get("mirek_valid", True) and raw_mirek is not None and not isinstance(raw_mirek, bool):
+            m = finite(raw_mirek, None, 153.0, 500.0)
+            if m is not None:
+                mirek = int(round(m))
+        effects_obj = light.get("effects") if isinstance(light.get("effects"), dict) else {}
+        raw_effect = effects_obj.get("status")
+        effect = raw_effect if isinstance(raw_effect, str) and EFFECT_RE.match(raw_effect) else "no_effect"
+        avail_effects = []
+        seen_eff = set()
+        raw_vals = effects_obj.get("effect_values")
+        if isinstance(raw_vals, list):
+            for ev in raw_vals:
+                if len(avail_effects) >= MAX_EFFECTS:
+                    break
+                if isinstance(ev, str) and EFFECT_RE.match(ev) and ev not in seen_eff:
+                    seen_eff.add(ev)
+                    avail_effects.append(ev)
+        return {
+            "id": light["id"],
+            "device_id": owner_id,
+            "name": clean((light.get("metadata") or {}).get("name") or "Light"),
+            "on": bool((light.get("on") or {}).get("on")),
+            "bri": round(brightness(dimming.get("brightness", 100.0)), 1),
+            "dimmable": "dimming" in light,
+            "color": light_color(light),
+            "reachable": connectivity.get(raw_owner or owner_id, True),
+            "supports_color": "color" in light,
+            "supports_ct": "color_temperature" in light,
+            "mirek": mirek,
+            "mirek_min": mirek_min,
+            "mirek_max": mirek_max,
+            "effect": effect,
+            "available_effects": avail_effects,
+            "motion_aware": False,
+            "motion_active": False,
+        }
+
+    device_lights = {}   # each device's light services, once and capped
+    for did, device in devices.items():
+        found = {}
+        for svc in device.get("services") or []:
+            if isinstance(svc, dict) and svc.get("rtype") == "light" and svc.get("rid") in lights:
+                found[svc["rid"]] = None
+                if len(found) >= MAX_GROUP_LIGHTS:
+                    break
+        device_lights[did] = list(found)
+    budget = [MAX_MEMBERSHIPS]
+
+    def lights_of(group):
+        ids = {}   # insertion-ordered set
+        limit = min(MAX_GROUP_LIGHTS, budget[0])
+
+        def add(rid):
+            if rid in lights and rid not in ids and len(ids) < limit:
+                ids[rid] = None
+
+        for child in group.get("children") or []:
+            if len(ids) >= limit:
+                break
+            if not isinstance(child, dict):
+                continue
+            rid, rtype = child.get("rid"), child.get("rtype")
+            if rtype == "light":
+                add(rid)
+            elif rtype == "device":
+                for lid in device_lights.get(rid, ()):
+                    add(lid)
+        budget[0] -= len(ids)
+        return list(ids)
+
+    scenes_by_group = {}
+    seen_scenes = set()
+    for scene in by_type.get("scene", []):
+        if len(seen_scenes) >= MAX_SCENES:
+            break
+        gid = ((scene.get("group") if isinstance(scene.get("group"), dict) else None) or {}).get("rid")
+        if not valid_uuid(scene.get("id")) or not valid_uuid(gid) or scene["id"] in seen_scenes:
+            continue
+        group_scenes = scenes_by_group.setdefault(gid, [])
+        if len(group_scenes) >= MAX_GROUP_SCENES:
+            continue
+        seen_scenes.add(scene["id"])
+        group_scenes.append({
+            "id": scene["id"],
+            "name": clean((scene.get("metadata") or {}).get("name") or "Scene", 30),
+            "active": (scene.get("status") or {}).get("active", "inactive") != "inactive",
+        })
+    for group_scenes in scenes_by_group.values():
+        group_scenes.sort(key=lambda s: s["name"].lower())
+
+    rooms = []
+    assigned = set()
+    seen_groups = set()
+    for kind in ("room", "zone"):
+        for group in by_type.get(kind, []):
+            if not valid_uuid(group.get("id")) or group["id"] in seen_groups:
+                continue
+            seen_groups.add(group["id"])
+            gl_id = None
+            for svc in group.get("services") or []:
+                if svc.get("rtype") == "grouped_light" and svc.get("rid") in grouped:
+                    gl_id = svc["rid"]
+            ids = lights_of(group)
+            if not ids:
+                continue
+            if kind == "room":
+                assigned.update(ids)
+            members = sorted((light_entry(lights[i]) for i in ids), key=lambda l: l["name"].lower())
+            on_members = [l for l in members if l["on"]]
+            gl = grouped.get(gl_id) or {}
+            bri = (gl.get("dimming") or {}).get("brightness")
+            bri = None if bri is None else brightness(bri)
+            if bri is None:
+                bri = sum(l["bri"] for l in on_members) / len(on_members) if on_members else 0
+            rooms.append({
+                "id": group["id"],
+                "kind": kind,
+                "name": clean((group.get("metadata") or {}).get("name") or kind.title()),
+                "grouped_light": gl_id or "",
+                "on": any(l["on"] for l in members),
+                "bri": round(float(bri), 1),
+                "on_count": len(on_members),
+                "archetype": clean((group.get("metadata") or {}).get("archetype") or "", 30),
+                "color": blend_colors([l["color"] for l in on_members]),
+                "lights": members,
+                "scenes": scenes_by_group.pop(group["id"], []),
+            })
+    loose = []
+    for lid, light in lights.items():
+        if len(loose) >= min(MAX_GROUP_LIGHTS, budget[0]):
+            break
+        if lid not in assigned:
+            loose.append(light_entry(light))
+    budget[0] -= len(loose)
+    if loose:
+        loose.sort(key=lambda l: l["name"].lower())
+        on_members = [l for l in loose if l["on"]]
+        rooms.append({
+            "id": "", "kind": "other", "name": "Other lights", "grouped_light": "",
+            "on": bool(on_members),
+            "bri": round(sum(l["bri"] for l in on_members) / len(on_members), 1) if on_members else 0,
+            "on_count": len(on_members), "archetype": "", "color": blend_colors([l["color"] for l in on_members]),
+            "lights": loose, "scenes": [],
+        })
+    rooms.sort(key=lambda r: (r["kind"] != "room", r["name"].lower()))
+    return rooms, len(lights), sum(1 for l in lights.values() if (l.get("on") or {}).get("on"))
+
+
+def extract_bridge_home_gl(resources):
+    """Extract the bridge_home grouped_light UUID from a CLIP v2 /resource list."""
+    if not isinstance(resources, list):
+        return ""
+    for res in resources:
+        if not isinstance(res, dict) or res.get("type") != "bridge_home":
+            continue
+        for svc in res.get("services") or []:
+            if isinstance(svc, dict) and svc.get("rtype") == "grouped_light" and valid_uuid(svc.get("rid")):
+                return svc["rid"]
+    return ""
+
+
+def extract_bridge_model_id(resources):
+    """Extract the Hue Bridge device's product_data.model_id (e.g. 'BSB003' for Bridge Pro)."""
+    if not isinstance(resources, list):
+        return ""
+    fallback = ""
+    for res in resources:
+        if not isinstance(res, dict) or res.get("type") != "device":
+            continue
+        pd = res.get("product_data") if isinstance(res.get("product_data"), dict) else {}
+        raw_mid = pd.get("model_id")
+        mid = clean(raw_mid, 32) if isinstance(raw_mid, str) else ""
+        services = res.get("services") if isinstance(res.get("services"), list) else []
+        is_bridge = any(isinstance(s, dict) and s.get("rtype") == "bridge" for s in services)
+        if is_bridge and mid:
+            return mid
+        if not fallback and mid.upper().startswith("BSB"):
+            fallback = mid
+    return fallback
+
+
+def _extract_motion_state(motion_obj, sse=False):
+    """Extract (motion_bool, motion_valid_bool) from a CLIP v2 motion dict."""
+    if not isinstance(motion_obj, dict):
+        return (None, None) if sse else (False, False)
+    has_valid = isinstance(motion_obj.get("motion_valid"), bool)
+    motion_valid = motion_obj["motion_valid"] if has_valid else None
+    report = motion_obj.get("motion_report") if isinstance(motion_obj.get("motion_report"), dict) else {}
+    rep_motion = report.get("motion") if isinstance(report.get("motion"), bool) else None
+    raw_motion = motion_obj.get("motion") if isinstance(motion_obj.get("motion"), bool) else None
+    if sse:
+        if has_valid:
+            if motion_valid:
+                val = rep_motion if rep_motion is not None else raw_motion
+            else:
+                val = raw_motion
+        else:
+            val = rep_motion if rep_motion is not None else raw_motion
+        return val, motion_valid
+    if has_valid:
+        if motion_valid:
+            val = rep_motion if rep_motion is not None else (raw_motion if raw_motion is not None else False)
+        else:
+            val = raw_motion if raw_motion is not None else False
+        return val, motion_valid
+    if rep_motion is not None:
+        return rep_motion, True
+    if raw_motion is not None:
+        return raw_motion, False
+    return False, False
+
+
+def _lux_from_light_level(raw):
+    """Convert CLIP v2 raw light_level to lux: round(10 ** ((raw - 1) / 10000.0), 1)."""
+    if raw is None or isinstance(raw, bool):
+        return None
+    val = finite(raw, None, 0.0, 65535.0)
+    if val is None:
+        return None
+    return round(10.0 ** ((val - 1.0) / 10000.0), 1)
+
+
+def count_motion_area_candidates(resources):
+    """Count unique valid motion_area_candidate resources in a CLIP v2 /resource list."""
+    if not isinstance(resources, list):
+        return 0
+    seen = set()
+    for res in resources:
+        if isinstance(res, dict) and res.get("type") == "motion_area_candidate" and valid_uuid(res.get("id")):
+            seen.add(res["id"])
+    return len(seen)
+
+
+def parse_motion_area_candidates(resources, rooms=None):
+    """Count Hue Bridge Pro `motion_area_candidate` resources and list eligible rooms (3+ candidates)."""
+    if not isinstance(resources, list):
+        return 0, []
+    seen = set()
+    cand_devices = set()
+    for res in resources:
+        if not isinstance(res, dict) or res.get("type") != "motion_area_candidate":
+            continue
+        cid = res.get("id")
+        if not valid_uuid(cid) or cid in seen:
+            continue
+        seen.add(cid)
+        owner = (res.get("owner") if isinstance(res.get("owner"), dict) else {}).get("rid")
+        if valid_uuid(owner):
+            cand_devices.add(owner)
+
+    eligible_rooms = []
+    if isinstance(rooms, list) and cand_devices:
+        for r in rooms:
+            if not isinstance(r, dict) or r.get("kind") != "room" or not valid_uuid(r.get("id")):
+                continue
+            matched = set()
+            for l in r.get("lights") or []:
+                if isinstance(l, dict):
+                    did = l.get("device_id")
+                    if did in cand_devices:
+                        matched.add(did)
+            if len(matched) >= 3:
+                eligible_rooms.append(r["id"])
+    return len(seen), eligible_rooms
+
+
+def parse_motion_areas(resources, rooms=None):
+    """Parse Hue Bridge Pro MotionAware resources from CLIP v2 /resource list."""
+    if not isinstance(resources, list):
+        return []
+    device_to_lights = {}
+    if isinstance(rooms, list):
+        for r in rooms:
+            if not isinstance(r, dict):
+                continue
+            for l in r.get("lights") or []:
+                if not isinstance(l, dict):
+                    continue
+                lid = l.get("id")
+                did = l.get("device_id")
+                if valid_uuid(did) and valid_uuid(lid):
+                    lids = device_to_lights.setdefault(did, [])
+                    if lid not in lids:
+                        lids.append(lid)
+
+    cand_to_device = {}
+    conv_by_owner = {}
+    sec_by_owner = {}
+    configs = []
+    for res in resources:
+        if not isinstance(res, dict) or not valid_uuid(res.get("id")):
+            continue
+        rtype = res.get("type")
+        if rtype == "light":
+            owner = (res.get("owner") if isinstance(res.get("owner"), dict) else {}).get("rid")
+            if valid_uuid(owner):
+                lids = device_to_lights.setdefault(owner, [])
+                if res["id"] not in lids:
+                    lids.append(res["id"])
+        elif rtype == "device":
+            did = res["id"]
+            for svc in res.get("services") or []:
+                if isinstance(svc, dict) and svc.get("rtype") == "light" and valid_uuid(svc.get("rid")):
+                    lids = device_to_lights.setdefault(did, [])
+                    if svc["rid"] not in lids:
+                        lids.append(svc["rid"])
+        elif rtype == "motion_area_candidate":
+            owner = (res.get("owner") if isinstance(res.get("owner"), dict) else {}).get("rid")
+            if valid_uuid(owner):
+                cand_to_device[res["id"]] = owner
+        elif rtype == "convenience_area_motion":
+            owner = (res.get("owner") if isinstance(res.get("owner"), dict) else {}).get("rid")
+            if valid_uuid(owner):
+                conv_by_owner.setdefault(owner, res)
+        elif rtype == "security_area_motion":
+            owner = (res.get("owner") if isinstance(res.get("owner"), dict) else {}).get("rid")
+            if valid_uuid(owner):
+                sec_by_owner.setdefault(owner, res)
+        elif rtype == "motion_area_configuration":
+            configs.append(res)
+
+    areas = []
+    seen = set()
+    for cfg in configs:
+        if len(areas) >= MAX_MOTION_AREAS:
+            break
+        cid = cfg["id"]
+        if cid in seen:
+            continue
+        seen.add(cid)
+        meta = cfg.get("metadata") if isinstance(cfg.get("metadata"), dict) else {}
+        name = clean(cfg.get("name") or meta.get("name") or "Motion Area", 60) or "Motion Area"
+        conv = conv_by_owner.get(cid) or sec_by_owner.get(cid)
+        if isinstance(cfg.get("enabled"), bool):
+            enabled = cfg["enabled"]
+        elif conv is not None and isinstance(conv.get("enabled"), bool):
+            enabled = conv["enabled"]
+        else:
+            enabled = True
+        grp = cfg.get("group") if isinstance(cfg.get("group"), dict) else {}
+        room_id = grp.get("rid") if valid_uuid(grp.get("rid")) else ""
+
+        light_ids = []
+        seen_lights = set()
+        healths = []
+        for part in (cfg.get("participants") if isinstance(cfg.get("participants"), list) else [])[:MAX_GROUP_LIGHTS]:
+            if not isinstance(part, dict):
+                continue
+            pres = part.get("resource") if isinstance(part.get("resource"), dict) else {}
+            prid = pres.get("rid")
+            prtype = pres.get("rtype")
+            if valid_uuid(prid):
+                if prtype == "light":
+                    resolved = [prid]
+                elif prtype == "device":
+                    resolved = device_to_lights.get(prid, [])
+                else:
+                    did = cand_to_device.get(prid)
+                    resolved = device_to_lights.get(did, []) if did else []
+                for lid in resolved:
+                    if lid not in seen_lights:
+                        seen_lights.add(lid)
+                        light_ids.append(lid)
+            pstatus = part.get("status") if isinstance(part.get("status"), dict) else {}
+            ph = pstatus.get("health") if isinstance(pstatus.get("health"), str) else (
+                part.get("health") if isinstance(part.get("health"), str) else ""
+            )
+            ph = clean(ph, 32)
+            if ph:
+                healths.append(ph)
+
+        bad_health = next((h for h in healths if h.lower() != "healthy"), "")
+        if bad_health:
+            health = bad_health
+        elif healths:
+            health = healths[0]
+        else:
+            top_status = cfg.get("status") if isinstance(cfg.get("status"), dict) else {}
+            top_h = clean(top_status.get("health") or "", 32) if isinstance(top_status.get("health"), str) else ""
+            health = top_h or "healthy"
+
+        if conv is not None:
+            convenience_id = conv["id"]
+            motion_val, motion_valid = _extract_motion_state(conv.get("motion"), sse=False)
+            sens_obj = conv.get("sensitivity") if isinstance(conv.get("sensitivity"), dict) else {}
+            raw_smax = sens_obj.get("sensitivity_max")
+            if raw_smax is not None and not isinstance(raw_smax, bool):
+                smax_f = finite(raw_smax, 4.0, 0.0, 100.0)
+                sens_max = int(round(smax_f))
+            else:
+                sens_max = 4
+            raw_s = sens_obj.get("sensitivity")
+            if raw_s is not None and not isinstance(raw_s, bool):
+                s_f = finite(raw_s, 0.0, 0.0, float(sens_max))
+                sens = int(round(s_f))
+            else:
+                sens = 0
+        else:
+            convenience_id = ""
+            motion_val = False
+            motion_valid = False
+            sens = 0
+            sens_max = 4
+
+        areas.append({
+            "id": cid,
+            "name": name,
+            "enabled": enabled,
+            "room_id": room_id,
+            "motion": motion_val,
+            "motion_valid": motion_valid,
+            "sensitivity": sens,
+            "sensitivity_max": sens_max,
+            "convenience_id": convenience_id,
+            "light_ids": light_ids,
+            "health": health,
+        })
+    areas.sort(key=lambda a: (a["name"].lower(), a["id"]))
+    return areas
+
+
+def annotate_motion_aware_lights(rooms, motion_areas):
+    """Set `motion_aware` and `motion_active` flags on every light in `rooms`."""
+    aware_ids = set()
+    active_ids = set()
+    for area in motion_areas or []:
+        if not isinstance(area, dict) or not area.get("enabled", False):
+            continue
+        lids = area.get("light_ids") or []
+        aware_ids.update(lids)
+        if area.get("motion"):
+            active_ids.update(lids)
+    for room in rooms or []:
+        if not isinstance(room, dict):
+            continue
+        for light in room.get("lights") or []:
+            if not isinstance(light, dict):
+                continue
+            lid = light.get("id")
+            light["motion_aware"] = lid in aware_ids
+            light["motion_active"] = lid in active_ids
+
+
+def _extract_sensor_service_owners(resources):
+    """Map companion/sensor service UUID -> device UUID for SSE correlation."""
+    owners = {}
+    if not isinstance(resources, list):
+        return owners
+    svc_types = ("motion", "contact", "button", "temperature", "light_level", "device_power")
+    for res in resources:
+        if not isinstance(res, dict) or not valid_uuid(res.get("id")):
+            continue
+        rtype = res.get("type")
+        if rtype in svc_types:
+            owner = (res.get("owner") if isinstance(res.get("owner"), dict) else {}).get("rid")
+            if valid_uuid(owner):
+                owners[res["id"]] = owner
+        elif rtype == "device":
+            did = res["id"]
+            for svc in res.get("services") or []:
+                if isinstance(svc, dict) and svc.get("rtype") in svc_types and valid_uuid(svc.get("rid")):
+                    owners.setdefault(svc["rid"], did)
+    return owners
+
+
+def parse_sensors(resources):
+    """Parse physical Hue motion sensors, contact sensors, and buttons/switches from CLIP v2 /resource."""
+    if not isinstance(resources, list):
+        return []
+    devices = {}
+    device_to_room = {}
+    temperatures = {}
+    light_levels = {}
+    device_powers = {}
+    motion_svcs = []
+    contact_svcs = []
+    button_groups = {}  # device_id -> list of button resources
+
+    for res in resources:
+        if not isinstance(res, dict) or not valid_uuid(res.get("id")):
+            continue
+        rtype = res.get("type")
+        if rtype == "device":
+            devices[res["id"]] = res
+        elif rtype == "room":
+            room_id = res["id"]
+            for child in res.get("children") or []:
+                if isinstance(child, dict) and child.get("rtype") == "device" and valid_uuid(child.get("rid")):
+                    device_to_room.setdefault(child["rid"], room_id)
+        elif rtype == "temperature":
+            owner = (res.get("owner") if isinstance(res.get("owner"), dict) else {}).get("rid")
+            if valid_uuid(owner):
+                tobj = res.get("temperature") if isinstance(res.get("temperature"), dict) else {}
+                if tobj.get("temperature_valid"):
+                    rep = tobj.get("temperature_report") if isinstance(tobj.get("temperature_report"), dict) else {}
+                    raw_t = rep.get("temperature")
+                    if raw_t is None or isinstance(raw_t, bool):
+                        raw_t = tobj.get("temperature")
+                    if raw_t is not None and not isinstance(raw_t, bool):
+                        tval = finite(raw_t, None, -50.0, 120.0)
+                        if tval is not None:
+                            temperatures[owner] = round(tval, 1)
+        elif rtype == "light_level":
+            owner = (res.get("owner") if isinstance(res.get("owner"), dict) else {}).get("rid")
+            if valid_uuid(owner):
+                lobj = res.get("light") if isinstance(res.get("light"), dict) else (
+                    res.get("light_level") if isinstance(res.get("light_level"), dict) else {}
+                )
+                if lobj.get("light_level_valid"):
+                    rep = lobj.get("light_level_report") if isinstance(lobj.get("light_level_report"), dict) else {}
+                    raw_ll = rep.get("light_level")
+                    if raw_ll is None or isinstance(raw_ll, bool):
+                        raw_ll = lobj.get("light_level")
+                    lux = _lux_from_light_level(raw_ll)
+                    if lux is not None:
+                        light_levels[owner] = lux
+        elif rtype == "device_power":
+            owner = (res.get("owner") if isinstance(res.get("owner"), dict) else {}).get("rid")
+            if valid_uuid(owner):
+                ps = res.get("power_state") if isinstance(res.get("power_state"), dict) else {}
+                raw_bat = ps.get("battery_level")
+                bat = None
+                if raw_bat is not None and not isinstance(raw_bat, bool):
+                    bf = finite(raw_bat, None, 0.0, 100.0)
+                    if bf is not None:
+                        bat = int(round(bf))
+                bstate = clean(ps.get("battery_state") or "", 24) if isinstance(ps.get("battery_state"), str) else ""
+                device_powers[owner] = (bat, bstate)
+        elif rtype == "motion":
+            motion_svcs.append(res)
+        elif rtype == "contact":
+            contact_svcs.append(res)
+        elif rtype == "button":
+            owner = (res.get("owner") if isinstance(res.get("owner"), dict) else {}).get("rid")
+            key = owner if valid_uuid(owner) else res["id"]
+            button_groups.setdefault(key, []).append(res)
+
+    def _device_name(did, res_obj, fallback):
+        dev = devices.get(did) if did else None
+        dev_name = ((dev.get("metadata") if isinstance(dev.get("metadata"), dict) else {}).get("name") if dev else "")
+        res_name = ((res_obj.get("metadata") if isinstance(res_obj.get("metadata"), dict) else {}).get("name") if res_obj else "")
+        return clean(dev_name or res_name or fallback, 60) or fallback
+
+    sensors = []
+    seen = set()
+
+    for res in motion_svcs:
+        if len(sensors) >= MAX_SENSORS:
+            break
+        sid = res["id"]
+        if ("motion", sid) in seen:
+            continue
+        seen.add(("motion", sid))
+        owner = (res.get("owner") if isinstance(res.get("owner"), dict) else {}).get("rid")
+        did = owner if valid_uuid(owner) else ""
+        bat, bstate = device_powers.get(did, (None, ""))
+        motion_val, _ = _extract_motion_state(res.get("motion"), sse=False)
+        sens_obj = res.get("sensitivity") if isinstance(res.get("sensitivity"), dict) else {}
+        raw_smax = sens_obj.get("sensitivity_max")
+        sens_max = None
+        if raw_smax is not None and not isinstance(raw_smax, bool):
+            sf = finite(raw_smax, None, 0.0, 100.0)
+            if sf is not None:
+                sens_max = int(round(sf))
+        raw_s = sens_obj.get("sensitivity")
+        sens = None
+        if raw_s is not None and not isinstance(raw_s, bool):
+            hi = float(sens_max) if sens_max is not None else 100.0
+            sf = finite(raw_s, None, 0.0, hi)
+            if sf is not None:
+                sens = int(round(sf))
+        sensors.append({
+            "id": sid,
+            "device_id": did,
+            "kind": "motion",
+            "name": _device_name(did, res, "Motion Sensor"),
+            "room_id": device_to_room.get(did, ""),
+            "enabled": res["enabled"] if isinstance(res.get("enabled"), bool) else True,
+            "motion": motion_val,
+            "open": False,
+            "temperature": temperatures.get(did),
+            "lux": light_levels.get(did),
+            "battery": bat,
+            "battery_state": bstate,
+            "sensitivity": sens,
+            "sensitivity_max": sens_max,
+            "button_ids": [],
+            "last_event": "",
+        })
+
+    for res in contact_svcs:
+        if len(sensors) >= MAX_SENSORS:
+            break
+        sid = res["id"]
+        if ("contact", sid) in seen:
+            continue
+        seen.add(("contact", sid))
+        owner = (res.get("owner") if isinstance(res.get("owner"), dict) else {}).get("rid")
+        did = owner if valid_uuid(owner) else ""
+        bat, bstate = device_powers.get(did, (None, ""))
+        rep = res.get("contact_report") if isinstance(res.get("contact_report"), dict) else {}
+        is_open = rep.get("state") == "no_contact"
+        sensors.append({
+            "id": sid,
+            "device_id": did,
+            "kind": "contact",
+            "name": _device_name(did, res, "Contact Sensor"),
+            "room_id": device_to_room.get(did, ""),
+            "enabled": res["enabled"] if isinstance(res.get("enabled"), bool) else True,
+            "motion": False,
+            "open": is_open,
+            "temperature": None,
+            "lux": None,
+            "battery": bat,
+            "battery_state": bstate,
+            "sensitivity": None,
+            "sensitivity_max": None,
+            "button_ids": [],
+            "last_event": "",
+        })
+
+    for did, btn_list in button_groups.items():
+        if len(sensors) >= MAX_SENSORS:
+            break
+        if ("button", did) in seen:
+            continue
+        seen.add(("button", did))
+        bat, bstate = device_powers.get(did, (None, ""))
+        btn_ids = []
+        seen_bids = set()
+        best_ts = ""
+        best_ev = ""
+        fallback_ev = ""
+        for bres in btn_list:
+            bid = bres["id"]
+            if bid not in seen_bids:
+                seen_bids.add(bid)
+                btn_ids.append(bid)
+            bobj = bres.get("button") if isinstance(bres.get("button"), dict) else {}
+            brep = bobj.get("button_report") if isinstance(bobj.get("button_report"), dict) else {}
+            ev = clean(brep.get("event") or "", 32) if isinstance(brep.get("event"), str) else ""
+            ts = brep.get("updated") if isinstance(brep.get("updated"), str) else ""
+            if ev:
+                if not best_ev or (ts and ts >= best_ts):
+                    best_ts = ts
+                    best_ev = ev
+            elif not fallback_ev and isinstance(bobj.get("last_event"), str):
+                fallback_ev = clean(bobj["last_event"], 32)
+        sensors.append({
+            "id": did,
+            "device_id": did,
+            "kind": "button",
+            "name": _device_name(did, btn_list[0], "Switch"),
+            "room_id": device_to_room.get(did, ""),
+            "enabled": True,
+            "motion": False,
+            "open": False,
+            "temperature": None,
+            "lux": None,
+            "battery": bat,
+            "battery_state": bstate,
+            "sensitivity": None,
+            "sensitivity_max": None,
+            "button_ids": btn_ids,
+            "last_event": best_ev or fallback_ev,
+        })
+
+    sensors.sort(key=lambda s: (s["kind"], s["name"].lower(), s["id"]))
+    return sensors
+
+
+def _extract_light_entertainment_services(resources):
+    """Map light_id -> entertainment service UUID via shared owner device."""
+    if not isinstance(resources, list):
+        return {}
+    device_lights = {}
+    device_ents = {}
+    for res in resources:
+        if not isinstance(res, dict) or not valid_uuid(res.get("id")):
+            continue
+        rtype = res.get("type")
+        if rtype == "light":
+            owner = (res.get("owner") if isinstance(res.get("owner"), dict) else {}).get("rid")
+            if valid_uuid(owner):
+                device_lights.setdefault(owner, []).append(res["id"])
+        elif rtype == "entertainment":
+            owner = (res.get("owner") if isinstance(res.get("owner"), dict) else {}).get("rid")
+            if valid_uuid(owner):
+                device_ents.setdefault(owner, []).append(res["id"])
+        elif rtype == "device":
+            did = res["id"]
+            for svc in res.get("services") or []:
+                if not isinstance(svc, dict) or not valid_uuid(svc.get("rid")):
+                    continue
+                if svc.get("rtype") == "light":
+                    if svc["rid"] not in device_lights.setdefault(did, []):
+                        device_lights[did].append(svc["rid"])
+                elif svc.get("rtype") == "entertainment":
+                    if svc["rid"] not in device_ents.setdefault(did, []):
+                        device_ents[did].append(svc["rid"])
+    mapping = {}
+    for did, lids in device_lights.items():
+        ents = device_ents.get(did) or []
+        if ents:
+            for lid in lids:
+                mapping.setdefault(lid, ents[0])
+    return mapping
+
+
+def parse_entertainment_areas(resources):
+    """Parse CLIP v2 `entertainment_configuration` resources into
+    [{id, name, channels: [...], locations: [{light_id, service_id, service_type, x, y, z}]}]."""
+    if not isinstance(resources, list):
+        return []
+    lights = set()
+    device_lights = {}
+    ent_to_device = {}
+    for res in resources:
+        if not isinstance(res, dict) or not valid_uuid(res.get("id")):
+            continue
+        rtype = res.get("type")
+        if rtype == "light":
+            lights.add(res["id"])
+            owner = (res.get("owner") if isinstance(res.get("owner"), dict) else {}).get("rid")
+            if valid_uuid(owner):
+                device_lights.setdefault(owner, []).append(res["id"])
+        elif rtype == "entertainment":
+            owner = (res.get("owner") if isinstance(res.get("owner"), dict) else {}).get("rid")
+            if valid_uuid(owner):
+                ent_to_device[res["id"]] = owner
+        elif rtype == "device":
+            did = res["id"]
+            for svc in res.get("services") or []:
+                if not isinstance(svc, dict) or not valid_uuid(svc.get("rid")):
+                    continue
+                if svc.get("rtype") == "light":
+                    if svc["rid"] not in device_lights.setdefault(did, []):
+                        device_lights[did].append(svc["rid"])
+                elif svc.get("rtype") == "entertainment":
+                    ent_to_device.setdefault(svc["rid"], did)
+
+    def resolve_light(svc_id, svc_type):
+        if svc_type == "light" and valid_uuid(svc_id):
+            return svc_id
+        did = ent_to_device.get(svc_id)
+        if did and device_lights.get(did):
+            return device_lights[did][0]
+        if svc_id in lights:
+            return svc_id
+        return ""
+
+    areas = []
+    seen = set()
+    for res in resources:
+        if len(areas) >= MAX_ENTERTAINMENT_AREAS:
+            break
+        if not isinstance(res, dict) or res.get("type") != "entertainment_configuration":
+            continue
+        aid = res.get("id")
+        if not valid_uuid(aid) or aid in seen:
+            continue
+        seen.add(aid)
+        meta = res.get("metadata") if isinstance(res.get("metadata"), dict) else {}
+        name = clean(meta.get("name") or res.get("name") or "Entertainment", 60) or "Entertainment"
+
+        channels = []
+        raw_channels = res.get("channels")
+        if isinstance(raw_channels, list):
+            for ch in raw_channels[:64]:
+                if not isinstance(ch, dict):
+                    continue
+                cid = ch.get("channel_id", 0)
+                if isinstance(cid, bool) or not isinstance(cid, (int, float)):
+                    cid = 0
+                pos = ch.get("position") if isinstance(ch.get("position"), dict) else {}
+                members = []
+                for mem in (ch.get("members") if isinstance(ch.get("members"), list) else [])[:16]:
+                    if not isinstance(mem, dict):
+                        continue
+                    svc = mem.get("service") if isinstance(mem.get("service"), dict) else {}
+                    srid = svc.get("rid")
+                    srtype = svc.get("rtype") if svc.get("rtype") in ("entertainment", "light") else "entertainment"
+                    if valid_uuid(srid):
+                        members.append({
+                            "service_id": srid,
+                            "service_type": srtype,
+                            "light_id": resolve_light(srid, srtype),
+                        })
+                channels.append({
+                    "channel_id": int(round(finite(cid, 0.0, 0.0, 255.0))),
+                    "position": {
+                        "x": round(finite(pos.get("x"), 0.0, -1.0, 1.0), 4),
+                        "y": round(finite(pos.get("y"), 0.0, -1.0, 1.0), 4),
+                        "z": round(finite(pos.get("z"), 0.0, -1.0, 1.0), 4),
+                    },
+                    "members": members,
+                })
+
+        locations = []
+        loc_obj = res.get("locations") if isinstance(res.get("locations"), dict) else {}
+        raw_locs = loc_obj.get("service_locations")
+        if isinstance(raw_locs, list):
+            for sl in raw_locs[:MAX_GROUP_LIGHTS]:
+                if not isinstance(sl, dict):
+                    continue
+                svc = sl.get("service") if isinstance(sl.get("service"), dict) else {}
+                srid = svc.get("rid") if valid_uuid(svc.get("rid")) else ""
+                srtype = svc.get("rtype") if svc.get("rtype") in ("entertainment", "light") else "entertainment"
+                lid = resolve_light(srid, srtype)
+                if not lid and valid_uuid(sl.get("light_id")):
+                    lid = sl["light_id"]
+                if not lid and not srid:
+                    continue
+                positions = sl.get("positions")
+                if isinstance(positions, list) and positions and isinstance(positions[0], dict):
+                    pos = positions[0]
+                elif isinstance(sl.get("position"), dict):
+                    pos = sl["position"]
+                else:
+                    pos = {}
+                locations.append({
+                    "light_id": lid,
+                    "service_id": srid,
+                    "service_type": srtype,
+                    "x": round(finite(pos.get("x"), 0.0, -1.0, 1.0), 4),
+                    "y": round(finite(pos.get("y"), 0.0, -1.0, 1.0), 4),
+                    "z": round(finite(pos.get("z"), 0.0, -1.0, 1.0), 4),
+                })
+
+        areas.append({
+            "id": aid,
+            "name": name,
+            "channels": channels,
+            "locations": locations,
+        })
+    areas.sort(key=lambda a: (a["name"].lower(), a["id"]))
+    return areas
+
+
+def _parse_hhmm(value):
+    if not isinstance(value, str):
+        return None
+    m = TIME_HHMM_RE.match(value.strip())
+    if not m:
+        return None
+    return int(m.group(1)), int(m.group(2))
+
+
+def _normalize_days(raw_days):
+    if not isinstance(raw_days, list):
+        return []
+    found = set()
+    for d in raw_days:
+        if not isinstance(d, str):
+            continue
+        low = d.strip().lower()
+        if low in DAY_SHORT_TO_FULL:
+            found.add(low)
+        elif low in DAY_FULL_TO_SHORT:
+            found.add(DAY_FULL_TO_SHORT[low])
+    return [d for d in DAY_ORDER if d in found]
+
+
+def _pick_schedule_script_id(resources):
+    """Find the best behavior_script UUID for schedules, falling back to Hue's standard schedule script."""
+    best = None
+    best_rank = 99
+    for res in resources if isinstance(resources, list) else []:
+        if not isinstance(res, dict) or res.get("type") != "behavior_script":
+            continue
+        sid = res.get("id")
+        if not valid_uuid(sid):
+            continue
+        if sid == DEFAULT_SCHEDULE_SCRIPT_ID:
+            return sid
+        meta = res.get("metadata") if isinstance(res.get("metadata"), dict) else {}
+        cat = str(meta.get("category") or "").lower()
+        name = str(meta.get("name") or "").lower()
+        text = cat + " " + name
+        if "schedule" in text:
+            rank = 1
+        elif any(k in text for k in ("timer", "wake_up", "wake up", "go_to_sleep", "go to sleep", "automation")):
+            rank = 2
+        else:
+            continue
+        if rank < best_rank:
+            best_rank, best = rank, sid
+    return best or DEFAULT_SCHEDULE_SCRIPT_ID
+
+
+def parse_schedules(resources, rooms=None):
+    """Parse CLIP v2 behavior_script + behavior_instance entries into (schedules, script_id)."""
+    if not isinstance(resources, list):
+        return [], DEFAULT_SCHEDULE_SCRIPT_ID
+    script_id = _pick_schedule_script_id(resources)
+    names = {}
+    for res in resources:
+        if not isinstance(res, dict) or not valid_uuid(res.get("id")):
+            continue
+        rtype = res.get("type")
+        if rtype in ("light", "room", "zone"):
+            names[(rtype, res["id"])] = clean((res.get("metadata") or {}).get("name") or "")
+    if isinstance(rooms, list):
+        for r in rooms:
+            if isinstance(r, dict):
+                if r.get("kind") in ("room", "zone") and valid_uuid(r.get("id")):
+                    names.setdefault((r["kind"], r["id"]), clean(r.get("name") or ""))
+                for l in r.get("lights") or []:
+                    if isinstance(l, dict) and valid_uuid(l.get("id")):
+                        names.setdefault(("light", l["id"]), clean(l.get("name") or ""))
+
+    schedules = []
+    seen = set()
+    for res in resources:
+        if len(schedules) >= MAX_SCHEDULES:
+            break
+        if not isinstance(res, dict) or res.get("type") != "behavior_instance":
+            continue
+        sid = res.get("id")
+        if not valid_uuid(sid) or sid in seen:
+            continue
+        cfg = res.get("configuration") if isinstance(res.get("configuration"), dict) else {}
+        # Trigger
+        when = cfg.get("when") if isinstance(cfg.get("when"), dict) else {}
+        when_ext = cfg.get("when_extended") if isinstance(cfg.get("when_extended"), dict) else {}
+        start_at = when_ext.get("start_at") if isinstance(when_ext.get("start_at"), dict) else {}
+        tp = when.get("time_point") if isinstance(when.get("time_point"), dict) else start_at.get("time_point")
+        if not isinstance(tp, dict):
+            continue
+        tp_type = tp.get("type")
+        if tp_type == "time":
+            trigger_kind = "time"
+            t = tp.get("time") if isinstance(tp.get("time"), dict) else {}
+            hh = int(round(finite(t.get("hour", 0), 0.0, 0.0, 23.0)))
+            mm = int(round(finite(t.get("minute", 0), 0.0, 0.0, 59.0)))
+            time_str = "%02d:%02d" % (hh, mm)
+            offset_min = 0
+        elif tp_type in ("sunrise", "sunset"):
+            trigger_kind = tp_type
+            time_str = ""
+            off = tp.get("offset") if isinstance(tp.get("offset"), dict) else {}
+            offset_min = int(round(finite(off.get("minutes", 0), 0.0, -120.0, 120.0)))
+        else:
+            continue
+        raw_days = when.get("recurrence_days") if isinstance(when.get("recurrence_days"), list) else when_ext.get("recurrence_days")
+        days = _normalize_days(raw_days)
+
+        # Target
+        target_kind, target_id = "", ""
+        where = cfg.get("where")
+        if isinstance(where, list):
+            for w in where:
+                if not isinstance(w, dict):
+                    continue
+                grp = w.get("group")
+                if isinstance(grp, dict) and grp.get("rtype") in ("light", "room", "zone") and valid_uuid(grp.get("rid")):
+                    target_kind, target_id = grp["rtype"], grp["rid"]
+                    break
+                items = w.get("items")
+                if isinstance(items, list):
+                    for it in items:
+                        if isinstance(it, dict) and it.get("rtype") in ("light", "room", "zone") and valid_uuid(it.get("rid")):
+                            target_kind, target_id = it["rtype"], it["rid"]
+                            break
+                    if target_id:
+                        break
+                if w.get("rtype") in ("light", "room", "zone") and valid_uuid(w.get("rid")):
+                    target_kind, target_id = w["rtype"], w["rid"]
+                    break
+        if not target_id and isinstance(cfg.get("group"), dict):
+            grp = cfg["group"]
+            if grp.get("rtype") in ("light", "room", "zone") and valid_uuid(grp.get("rid")):
+                target_kind, target_id = grp["rtype"], grp["rid"]
+        if not target_id:
+            continue
+
+        # Action & fade
+        action, bri, scene_id = "on", None, ""
+        fade_min = 0
+        for fkey in ("fade_in_duration", "fade_out_duration", "duration"):
+            fobj = cfg.get(fkey)
+            if isinstance(fobj, dict):
+                if "seconds" in fobj and not isinstance(fobj.get("seconds"), bool):
+                    fade_min = int(round(finite(fobj.get("seconds"), 0.0, 0.0, 3600.0) / 60.0))
+                    break
+                if "minutes" in fobj and not isinstance(fobj.get("minutes"), bool):
+                    fade_min = int(round(finite(fobj.get("minutes"), 0.0, 0.0, 60.0)))
+                    break
+        what = cfg.get("what")
+        if isinstance(what, dict):
+            what = [what]
+        elif not isinstance(what, list):
+            what = cfg.get("what_at_start")
+            if isinstance(what, dict):
+                what = [what]
+            elif not isinstance(what, list):
+                what = []
+        matched_what = False
+        for entry in what:
+            if not isinstance(entry, dict):
+                continue
+            recall = entry.get("recall")
+            if isinstance(recall, dict) and valid_uuid(recall.get("rid")):
+                action, scene_id, matched_what = "scene", recall["rid"], True
+                break
+            on_obj = entry.get("on")
+            dim_obj = entry.get("dimming")
+            if isinstance(on_obj, dict) and isinstance(on_obj.get("on"), bool):
+                action = "on" if on_obj["on"] else "off"
+                matched_what = True
+                if action == "on" and isinstance(dim_obj, dict) and dim_obj.get("brightness") is not None and not isinstance(dim_obj.get("brightness"), bool):
+                    b = finite(dim_obj.get("brightness"), None, 1.0, 100.0)
+                    if b is not None:
+                        bri = int(round(b))
+                break
+            if isinstance(dim_obj, dict) and dim_obj.get("brightness") is not None and not isinstance(dim_obj.get("brightness"), bool):
+                b = finite(dim_obj.get("brightness"), None, 1.0, 100.0)
+                if b is not None:
+                    action, bri, matched_what = "on", int(round(b)), True
+                    break
+        if not matched_what and cfg.get("end_state") == "turn_off":
+            action = "off"
+
+        seen.add(sid)
+        meta = res.get("metadata") if isinstance(res.get("metadata"), dict) else {}
+        schedules.append({
+            "id": sid,
+            "name": clean(meta.get("name") or "Schedule", 60) or "Schedule",
+            "enabled": bool(res.get("enabled", False)),
+            "target_kind": target_kind,
+            "target_id": target_id,
+            "target_name": names.get((target_kind, target_id), ""),
+            "trigger_kind": trigger_kind,
+            "time": time_str,
+            "offset_min": offset_min,
+            "days": days,
+            "action": action,
+            "bri": bri,
+            "scene_id": scene_id,
+            "fade_min": fade_min,
+            "source": "bridge",
+        })
+    schedules.sort(key=lambda s: (s["name"].lower(), s["id"]))
+    return schedules, script_id
+
+
+def build_schedule_payload(cmd, script_id=DEFAULT_SCHEDULE_SCRIPT_ID):
+    """Validate schedule_create inputs and build a CLIP v2 behavior_instance POST payload, or None."""
+    if not isinstance(cmd, dict):
+        return None
+    if not valid_uuid(script_id):
+        script_id = DEFAULT_SCHEDULE_SCRIPT_ID
+    target_kind = cmd.get("target_kind")
+    target_id = cmd.get("target_id")
+    if target_kind not in ("light", "room", "zone") or not valid_uuid(target_id):
+        return None
+    trigger_kind = cmd.get("trigger_kind")
+    if trigger_kind not in ("time", "sunrise", "sunset"):
+        return None
+    if trigger_kind == "time":
+        hm = _parse_hhmm(cmd.get("time"))
+        if hm is None:
+            return None
+        time_point = {"type": "time", "time": {"hour": hm[0], "minute": hm[1]}}
+    else:
+        raw_off = cmd.get("offset_min", 0)
+        if raw_off is None:
+            raw_off = 0
+        if isinstance(raw_off, bool) or not isinstance(raw_off, (int, float)):
+            return None
+        off = finite(raw_off, None, -120.0, 120.0)
+        if off is None:
+            return None
+        time_point = {"type": trigger_kind, "offset": {"minutes": int(round(off))}}
+
+    raw_days = cmd.get("days", [])
+    if raw_days is None:
+        raw_days = []
+    if not isinstance(raw_days, list):
+        return None
+    days = []
+    seen_days = set()
+    for d in raw_days:
+        if not isinstance(d, str):
+            return None
+        low = d.strip().lower()
+        if low in DAY_SHORT_TO_FULL:
+            short = low
+        elif low in DAY_FULL_TO_SHORT:
+            short = DAY_FULL_TO_SHORT[low]
+        else:
+            return None
+        if short not in seen_days:
+            seen_days.add(short)
+            days.append(short)
+    days = [d for d in DAY_ORDER if d in seen_days]
+
+    action = cmd.get("action")
+    if action not in ("on", "off", "scene"):
+        return None
+    bri = None
+    scene_id = ""
+    if action == "scene":
+        scene_id = cmd.get("scene_id")
+        if not valid_uuid(scene_id):
+            return None
+        what = [{"recall": {"rid": scene_id, "rtype": "scene"}}]
+    elif action == "off":
+        what = [{"on": {"on": False}}]
+    else:
+        entry = {"on": {"on": True}}
+        raw_bri = cmd.get("bri")
+        if raw_bri is not None:
+            if isinstance(raw_bri, bool) or not isinstance(raw_bri, (int, float)):
+                return None
+            b = finite(raw_bri, None, 1.0, 100.0)
+            if b is None:
+                return None
+            bri = int(round(b))
+            entry["dimming"] = {"brightness": bri}
+        what = [entry]
+
+    raw_fade = cmd.get("fade_min", 0)
+    if raw_fade is None:
+        raw_fade = 0
+    if isinstance(raw_fade, bool) or not isinstance(raw_fade, (int, float)):
+        return None
+    fade = finite(raw_fade, None, 0.0, 60.0)
+    if fade is None:
+        return None
+    fade_min = int(round(fade))
+
+    enabled = cmd.get("enabled", True)
+    if not isinstance(enabled, bool):
+        return None
+    name = clean(cmd.get("name") or "", 60) or "Schedule"
+
+    when = {"time_point": time_point}
+    if days:
+        when["recurrence_days"] = [DAY_SHORT_TO_FULL[d] for d in days]
+    if target_kind == "light":
+        where = [{"items": [{"rid": target_id, "rtype": "light"}]}]
+    else:
+        where = [{"group": {"rid": target_id, "rtype": target_kind}}]
+    config = {"where": where, "when": when, "what": what}
+    if fade_min > 0:
+        if action == "off":
+            config["fade_out_duration"] = {"seconds": fade_min * 60}
+        else:
+            config["fade_in_duration"] = {"seconds": fade_min * 60}
+    return {
+        "type": "behavior_instance",
+        "script_id": script_id,
+        "enabled": enabled,
+        "metadata": {"name": name},
+        "configuration": config,
+    }
+
+
+def parse_sse_events(payload):
+    """Parse one CLIP v2 SSE JSON array payload into [(kind, rid, changes), ...]."""
+    if not payload or len(payload) > MAX_BODY:
+        return []
+    try:
+        events = json.loads(payload)
+    except (ValueError, TypeError, RecursionError):
+        return []
+    if not isinstance(events, list):
+        return []
+    supported = (
+        "light", "grouped_light",
+        "motion", "contact", "button",
+        "temperature", "light_level", "device_power",
+        "convenience_area_motion", "security_area_motion", "motion_area_configuration",
+    )
+    updates = []
+    for ev in events:
+        if not isinstance(ev, dict) or ev.get("type") != "update":
+            continue
+        items = ev.get("data")
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            kind = item.get("type")
+            rid = item.get("id")
+            if kind not in supported or not valid_uuid(rid):
+                continue
+            changes = {}
+            if kind in ("light", "grouped_light"):
+                on_obj = item.get("on")
+                if isinstance(on_obj, dict) and isinstance(on_obj.get("on"), bool):
+                    changes["on"] = on_obj["on"]
+                dim_obj = item.get("dimming")
+                if isinstance(dim_obj, dict) and dim_obj.get("brightness") is not None and not isinstance(dim_obj.get("brightness"), bool):
+                    b = finite(dim_obj.get("brightness"), None, 0.0, 100.0)
+                    if b is not None:
+                        changes["bri"] = round(b, 1)
+                ct_obj = item.get("color_temperature")
+                if isinstance(ct_obj, dict):
+                    if ct_obj.get("mirek_valid") is False:
+                        changes["mirek"] = None
+                    elif ct_obj.get("mirek") is not None and not isinstance(ct_obj.get("mirek"), bool):
+                        m = finite(ct_obj.get("mirek"), None, 153.0, 500.0)
+                        if m is not None:
+                            changes["mirek"] = int(round(m))
+                col_obj = item.get("color")
+                if isinstance(col_obj, dict) and isinstance(col_obj.get("xy"), dict):
+                    xy = col_obj["xy"]
+                    rx, ry = xy.get("x"), xy.get("y")
+                    if not isinstance(rx, bool) and not isinstance(ry, bool):
+                        x, y = finite(rx, None, 0.0, 1.0), finite(ry, None, 0.0, 1.0)
+                        if x is not None and y is not None and y > 0:
+                            changes["xy"] = (round(x, 4), round(y, 4))
+                eff_obj = item.get("effects")
+                if isinstance(eff_obj, dict):
+                    st = eff_obj.get("status")
+                    if isinstance(st, str) and EFFECT_RE.match(st):
+                        changes["effect"] = st
+                meta_obj = item.get("metadata")
+                if isinstance(meta_obj, dict) and isinstance(meta_obj.get("name"), str):
+                    nm = clean(meta_obj["name"], 60)
+                    if nm:
+                        changes["name"] = nm
+            elif kind in ("motion", "convenience_area_motion", "security_area_motion"):
+                if isinstance(item.get("enabled"), bool):
+                    changes["enabled"] = item["enabled"]
+                mval, mvalid = _extract_motion_state(item.get("motion"), sse=True)
+                if mval is not None:
+                    changes["motion"] = mval
+                if mvalid is not None:
+                    changes["motion_valid"] = mvalid
+                sens_obj = item.get("sensitivity")
+                if isinstance(sens_obj, dict):
+                    raw_s = sens_obj.get("sensitivity")
+                    if raw_s is not None and not isinstance(raw_s, bool):
+                        sf = finite(raw_s, None, 0.0, 100.0)
+                        if sf is not None:
+                            changes["sensitivity"] = int(round(sf))
+            elif kind == "motion_area_configuration":
+                if isinstance(item.get("enabled"), bool):
+                    changes["enabled"] = item["enabled"]
+                meta_obj = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+                raw_nm = item.get("name") if isinstance(item.get("name"), str) else meta_obj.get("name")
+                if isinstance(raw_nm, str):
+                    nm = clean(raw_nm, 60)
+                    if nm:
+                        changes["name"] = nm
+            elif kind == "contact":
+                if isinstance(item.get("enabled"), bool):
+                    changes["enabled"] = item["enabled"]
+                rep = item.get("contact_report")
+                if isinstance(rep, dict) and isinstance(rep.get("state"), str):
+                    changes["open"] = (rep["state"] == "no_contact")
+            elif kind == "button":
+                bobj = item.get("button")
+                if isinstance(bobj, dict):
+                    brep = bobj.get("button_report") if isinstance(bobj.get("button_report"), dict) else {}
+                    raw_ev = brep.get("event") if isinstance(brep.get("event"), str) else bobj.get("last_event")
+                    if isinstance(raw_ev, str):
+                        ev_clean = clean(raw_ev, 32)
+                        if ev_clean:
+                            changes["last_event"] = ev_clean
+            elif kind == "temperature":
+                tobj = item.get("temperature")
+                if isinstance(tobj, dict) and tobj.get("temperature_valid") is not False:
+                    rep = tobj.get("temperature_report") if isinstance(tobj.get("temperature_report"), dict) else {}
+                    raw_t = rep.get("temperature")
+                    if raw_t is None or isinstance(raw_t, bool):
+                        raw_t = tobj.get("temperature")
+                    if raw_t is not None and not isinstance(raw_t, bool):
+                        tv = finite(raw_t, None, -50.0, 120.0)
+                        if tv is not None:
+                            changes["temperature"] = round(tv, 1)
+            elif kind == "light_level":
+                lobj = item.get("light") if isinstance(item.get("light"), dict) else item.get("light_level")
+                if isinstance(lobj, dict) and lobj.get("light_level_valid") is not False:
+                    rep = lobj.get("light_level_report") if isinstance(lobj.get("light_level_report"), dict) else {}
+                    raw_ll = rep.get("light_level")
+                    if raw_ll is None or isinstance(raw_ll, bool):
+                        raw_ll = lobj.get("light_level")
+                    lux = _lux_from_light_level(raw_ll)
+                    if lux is not None:
+                        changes["lux"] = lux
+            elif kind == "device_power":
+                ps = item.get("power_state")
+                if isinstance(ps, dict):
+                    raw_bat = ps.get("battery_level")
+                    if raw_bat is not None and not isinstance(raw_bat, bool):
+                        bf = finite(raw_bat, None, 0.0, 100.0)
+                        if bf is not None:
+                            changes["battery"] = int(round(bf))
+                    if isinstance(ps.get("battery_state"), str):
+                        bs = clean(ps["battery_state"], 24)
+                        if bs:
+                            changes["battery_state"] = bs
+            if changes:
+                if kind not in ("light", "grouped_light"):
+                    owner_obj = item.get("owner")
+                    if isinstance(owner_obj, dict) and valid_uuid(owner_obj.get("rid")):
+                        changes["owner_id"] = owner_obj["rid"]
+                updates.append((kind, rid, changes))
+    return updates
+
+
+def parse_sse_data_line(line):
+    """Parse one raw SSE line; returns list of updates when line starts with `data:`, else []."""
+    if isinstance(line, bytes):
+        if len(line) > MAX_BODY:
+            return []
+        line = line.decode("utf-8", "replace")
+    if not isinstance(line, str) or len(line) > MAX_BODY:
+        return []
+    line = line.rstrip("\r\n")
+    if not line.startswith("data:"):
+        return []
+    return parse_sse_events(line[5:].lstrip())
+
+
+def validate_rule(raw):
+    """Validate and normalize a Dependency / Linked-Light Rule dict, or return None."""
+    if not isinstance(raw, dict):
+        return None
+    rid = raw.get("id")
+    if rid is None or rid == "":
+        rid = str(uuid.uuid4())
+    elif not valid_uuid(rid):
+        return None
+    name = clean(raw.get("name") or "", 60) or "Rule"
+    enabled = raw.get("enabled", True)
+    if not isinstance(enabled, bool):
+        return None
+    kind = raw.get("kind")
+    if kind not in RULE_KINDS:
+        return None
+    trigger_kind = raw.get("trigger_kind")
+    trigger_id = raw.get("trigger_id")
+    trigger_state = raw.get("trigger_state", "")
+    if trigger_kind == "desktop":
+        if trigger_id not in ("wake", "sleep"):
+            return None
+        if trigger_state not in ("", "on", "off"):
+            return None
+        trigger_state = ""
+    elif trigger_kind in ("light", "room"):
+        if not _valid_fp_resource_id(trigger_id):
+            return None
+        if trigger_state not in ("on", "off"):
+            return None
+    elif trigger_kind in ("motion", "motion_area"):
+        if not _valid_fp_resource_id(trigger_id):
+            return None
+        if trigger_state not in ("motion", "clear"):
+            return None
+    elif trigger_kind == "contact":
+        if not _valid_fp_resource_id(trigger_id):
+            return None
+        if trigger_state not in ("open", "closed"):
+            return None
+    elif trigger_kind == "button":
+        if not _valid_fp_resource_id(trigger_id):
+            return None
+        if trigger_state not in ("press", "long_press"):
+            return None
+    else:
+        return None
+
+    raw_targets = raw.get("targets")
+    if not isinstance(raw_targets, list) or not (1 <= len(raw_targets) <= MAX_RULE_TARGETS):
+        return None
+    targets = []
+    seen_targets = set()
+    for t in raw_targets:
+        if not isinstance(t, dict):
+            return None
+        tkind = t.get("kind")
+        tid = t.get("id")
+        action = t.get("action")
+        if tkind not in ("light", "room") or not _valid_fp_resource_id(tid) or action not in ("on", "off"):
+            return None
+        if tkind == trigger_kind and tid == trigger_id:
+            return None
+        if (tkind, tid) in seen_targets:
+            continue
+        seen_targets.add((tkind, tid))
+        raw_bri = t.get("bri")
+        bri = None
+        if raw_bri is not None:
+            if isinstance(raw_bri, bool) or not isinstance(raw_bri, (int, float)):
+                return None
+            b = finite(raw_bri, None, 1.0, 100.0)
+            if b is None:
+                return None
+            bri = int(round(b))
+        scene_id = t.get("scene_id", "")
+        if scene_id is None:
+            scene_id = ""
+        if not isinstance(scene_id, str) or (scene_id and not _valid_fp_resource_id(scene_id)):
+            return None
+        targets.append({"kind": tkind, "id": tid, "action": action, "bri": bri, "scene_id": scene_id})
+    if not targets:
+        return None
+
+    mirror_off = raw.get("mirror_off", False)
+    match_bri = raw.get("match_bri", False)
+    only_if_off = raw.get("only_if_off", False)
+    if not (isinstance(mirror_off, bool) and isinstance(match_bri, bool) and isinstance(only_if_off, bool)):
+        return None
+
+    time_start = raw.get("time_start", "")
+    time_end = raw.get("time_end", "")
+    if time_start is None:
+        time_start = ""
+    if time_end is None:
+        time_end = ""
+    if not isinstance(time_start, str) or not isinstance(time_end, str):
+        return None
+    time_start, time_end = time_start.strip(), time_end.strip()
+    if bool(time_start) != bool(time_end):
+        return None
+    if time_start:
+        if _parse_hhmm(time_start) is None or _parse_hhmm(time_end) is None:
+            return None
+
+    return {
+        "id": rid,
+        "name": name,
+        "enabled": enabled,
+        "kind": kind,
+        "trigger_kind": trigger_kind,
+        "trigger_id": trigger_id,
+        "trigger_state": trigger_state,
+        "targets": targets,
+        "mirror_off": mirror_off,
+        "match_bri": match_bri,
+        "time_start": time_start,
+        "time_end": time_end,
+        "only_if_off": only_if_off,
+    }
+
+
+def detect_rule_cycles(rules):
+    """Check enabled rules for contradictory cycles or chains deeper than MAX_CASCADE_DEPTH (3).
+
+    Returns an error reason string if invalid, or '' if safe.
+    Safe symmetric pairs (A ON -> B ON and B ON -> A ON) are allowed because echo suppression
+    prevents infinite loops.
+    """
+    adj = {}  # (kind, id, state) -> set of (kind, id, state)
+    for r in rules if isinstance(rules, list) else []:
+        if not isinstance(r, dict) or not r.get("enabled", True):
+            continue
+        tk = r.get("trigger_kind")
+        tid = r.get("trigger_id")
+        ts = r.get("trigger_state")
+        if tk not in ("light", "room") or ts not in ("on", "off"):
+            continue
+        src = (tk, tid, ts)
+        for t in r.get("targets") or []:
+            dst = (t["kind"], t["id"], t["action"])
+            adj.setdefault(src, set()).add(dst)
+            if r.get("mirror_off") and ts == "on":
+                adj.setdefault((tk, tid, "off"), set()).add((t["kind"], t["id"], "off"))
+
+    def dfs(node, res_states, depth):
+        for nxt in adj.get(node, ()):
+            nxt_res = (nxt[0], nxt[1])
+            nxt_state = nxt[2]
+            if nxt_res in res_states:
+                if res_states[nxt_res] != nxt_state:
+                    return "contradictory rule cycle"
+                # Consistent cycle (e.g. A ON -> B ON -> A ON): allowed via echo suppression
+                continue
+            if depth + 1 > MAX_CASCADE_DEPTH:
+                return "rule chain depth exceeds %d" % MAX_CASCADE_DEPTH
+            res_states[nxt_res] = nxt_state
+            err = dfs(nxt, res_states, depth + 1)
+            del res_states[nxt_res]
+            if err:
+                return err
+        return ""
+
+    for start in list(adj):
+        err = dfs(start, {(start[0], start[1]): start[2]}, 0)
+        if err:
+            return err
+    return ""
+
+
+def in_time_window(time_start, time_end, now=None):
+    """True when `now` (tuple (hour, minute) or None for localtime) falls in [time_start, time_end)."""
+    if not time_start or not time_end:
+        return True
+    s = _parse_hhmm(time_start)
+    e = _parse_hhmm(time_end)
+    if s is None or e is None:
+        return False
+    if now is None:
+        lt = time.localtime()
+        cur = lt.tm_hour * 60 + lt.tm_min
+    else:
+        cur = int(now[0]) * 60 + int(now[1])
+    s_min = s[0] * 60 + s[1]
+    e_min = e[0] * 60 + e[1]
+    if s_min == e_min:
+        return True
+    if s_min < e_min:
+        return s_min <= cur < e_min
+    return cur >= s_min or cur < e_min
+
+
+def _echo_entry(entry):
+    """Decode echo_suppress entry (expires, expected_on) or legacy bare float timestamp."""
+    if isinstance(entry, tuple) and len(entry) == 2:
+        return float(entry[0]), entry[1]
+    return float(entry), None
+
+
+def validate_theme(raw):
+    """Validate and normalize a custom per-lamp light theme dict, or return None."""
+    if not isinstance(raw, dict):
+        return None
+    tid = raw.get("id")
+    if tid is None or tid == "":
+        tid = str(uuid.uuid4())
+    elif not isinstance(tid, str) or THEME_ID_RE.match(tid) is None or tid in BUILTIN_THEME_IDS:
+        return None
+    name = clean(raw.get("name") or "", 60) or "Theme"
+    raw_mirek = raw.get("mirek")
+    mirek = None
+    if raw_mirek is not None:
+        if isinstance(raw_mirek, bool) or not isinstance(raw_mirek, (int, float)):
+            return None
+        m = finite(raw_mirek, None, 153.0, 500.0)
+        if m is None:
+            return None
+        mirek = int(round(m))
+    raw_hex = raw.get("hex")
+    if raw_hex is None or raw_hex == "":
+        if mirek is None:
+            return None
+        hex_val = mirek_to_hex(mirek)
+    elif isinstance(raw_hex, str) and HEX_COLOR_RE.fullmatch(raw_hex.strip()):
+        s = raw_hex.strip()
+        hex_val = (s if s.startswith("#") else "#" + s).lower()
+    else:
+        return None
+    raw_bri = raw.get("bri", 80)
+    if isinstance(raw_bri, bool) or not isinstance(raw_bri, (int, float)):
+        return None
+    b = finite(raw_bri, None, 1.0, 100.0)
+    if b is None:
+        return None
+    bri = int(round(b))
+    raw_eff = raw.get("effect", "no_effect")
+    if raw_eff is None or raw_eff == "":
+        effect = "no_effect"
+    elif isinstance(raw_eff, str) and EFFECT_RE.match(raw_eff):
+        effect = raw_eff
+    else:
+        return None
+    return {
+        "id": tid,
+        "name": name,
+        "hex": hex_val,
+        "mirek": mirek,
+        "bri": bri,
+        "effect": effect,
+        "built_in": False,
+    }
+
+
+def validate_local_schedule(raw):
+    """Validate and normalize a local schedule dict, or return None."""
+    if not isinstance(raw, dict):
+        return None
+    sid = raw.get("id")
+    if sid is None or sid == "":
+        sid = str(uuid.uuid4())
+    elif not valid_uuid(sid):
+        return None
+    name = clean(raw.get("name") or "", 60) or "Schedule"
+    enabled = raw.get("enabled", True)
+    if not isinstance(enabled, bool):
+        return None
+    target_kind = raw.get("target_kind")
+    target_id = raw.get("target_id")
+    if target_kind not in ("light", "room", "zone") or not _valid_fp_resource_id(target_id):
+        return None
+    target_name = clean(raw.get("target_name") or "", 60)
+    trigger_kind = raw.get("trigger_kind", "time")
+    if trigger_kind != "time":
+        return None
+    hm = _parse_hhmm(raw.get("time"))
+    if hm is None:
+        return None
+    raw_days = raw.get("days", [])
+    if raw_days is None:
+        raw_days = []
+    if not isinstance(raw_days, list):
+        return None
+    seen_days = set()
+    for d in raw_days:
+        if not isinstance(d, str):
+            return None
+        low = d.strip().lower()
+        if low in DAY_SHORT_TO_FULL:
+            seen_days.add(low)
+        elif low in DAY_FULL_TO_SHORT:
+            seen_days.add(DAY_FULL_TO_SHORT[low])
+        else:
+            return None
+    days = [d for d in DAY_ORDER if d in seen_days]
+    action = raw.get("action")
+    if action not in ("on", "off", "scene"):
+        return None
+    bri = None
+    scene_id = ""
+    if action == "scene":
+        scene_id = raw.get("scene_id")
+        if not _valid_fp_resource_id(scene_id):
+            return None
+    elif action == "on":
+        raw_bri = raw.get("bri")
+        if raw_bri is not None:
+            if isinstance(raw_bri, bool) or not isinstance(raw_bri, (int, float)):
+                return None
+            b = finite(raw_bri, None, 1.0, 100.0)
+            if b is None:
+                return None
+            bri = int(round(b))
+    raw_fade = raw.get("fade_min", 0)
+    if raw_fade is None:
+        raw_fade = 0
+    if isinstance(raw_fade, bool) or not isinstance(raw_fade, (int, float)):
+        return None
+    fade = finite(raw_fade, None, 0.0, 60.0)
+    if fade is None:
+        return None
+    last_fired = raw.get("last_fired")
+    if not isinstance(last_fired, str) or len(last_fired) > 16:
+        last_fired = ""
+    out = {
+        "id": sid,
+        "name": name,
+        "enabled": enabled,
+        "target_kind": target_kind,
+        "target_id": target_id,
+        "target_name": target_name,
+        "trigger_kind": "time",
+        "time": "%02d:%02d" % hm,
+        "offset_min": 0,
+        "days": days,
+        "action": action,
+        "bri": bri,
+        "scene_id": scene_id,
+        "fade_min": int(round(fade)),
+        "source": "local",
+    }
+    if last_fired:
+        out["last_fired"] = last_fired
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Floorplan model, validation, starter prototypes & spatial sync helpers
+
+def _strict_finite(value, low, high):
+    """Strict numeric check: rejects bool, non-numeric, NaN, and Inf; clamps finite floats to [low, high]."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    num = float(value)
+    if not math.isfinite(num):
+        return None
+    return clamp(num, low, high)
+
+
+def _detect_image_ext(data):
+    """Detect PNG, JPEG, or WEBP format from magic bytes, or return None."""
+    if not isinstance(data, (bytes, bytearray, memoryview)) or len(data) < 12:
+        return None
+    b = bytes(data[:12])
+    if b.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if b.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if b[:4] == b"RIFF" and b[8:12] == b"WEBP":
+        return ".webp"
+    return None
+
+
+def _image_dimensions(data, ext):
+    """Parse declared (width, height) from PNG/JPEG/WEBP headers, or return None if invalid."""
+    if not isinstance(data, (bytes, bytearray)):
+        return None
+    if ext == ".png":
+        if len(data) < 24 or data[12:16] != b"IHDR":
+            return None
+        w, h = struct.unpack(">II", data[16:24])
+        return (w, h)
+    if ext == ".jpg":
+        pos = 2
+        n = len(data)
+        sof = {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF}
+        while pos + 4 <= n:
+            if data[pos] != 0xFF:
+                return None
+            while pos < n and data[pos] == 0xFF:
+                pos += 1
+            if pos >= n:
+                return None
+            marker = data[pos]
+            pos += 1
+            if marker in (0xD8, 0xD9, 0x01) or (0xD0 <= marker <= 0xD7):
+                continue
+            if pos + 2 > n:
+                return None
+            seg_len = struct.unpack(">H", data[pos:pos + 2])[0]
+            if seg_len < 2 or pos + seg_len > n:
+                return None
+            if marker in sof:
+                if seg_len < 7:
+                    return None
+                h, w = struct.unpack(">HH", data[pos + 3:pos + 7])
+                return (w, h)
+            pos += seg_len
+        return None
+    if ext == ".webp":
+        if len(data) < 25:
+            return None
+        fourcc = data[12:16]
+        if fourcc == b"VP8X" and len(data) >= 30:
+            w = 1 + int.from_bytes(data[24:27], "little")
+            h = 1 + int.from_bytes(data[27:30], "little")
+            return (w, h)
+        if fourcc == b"VP8 " and len(data) >= 30 and data[23:26] == b"\x9d\x01\x2a":
+            w = struct.unpack("<H", data[26:28])[0] & 0x3FFF
+            h = struct.unpack("<H", data[28:30])[0] & 0x3FFF
+            return (w, h)
+        if fourcc == b"VP8L" and len(data) >= 25 and data[20] == 0x2F:
+            bits = struct.unpack("<I", data[21:25])[0]
+            w = (bits & 0x3FFF) + 1
+            h = ((bits >> 14) & 0x3FFF) + 1
+            return (w, h)
+        return None
+    return None
+
+
+def _validate_managed_bg_path(path):
+    """Return normalized absolute path iff `path` is a real, regular, non-symlink
+    `floorplan_bg.<ext>` file strictly inside CONFIG_DIR, else None."""
+    if not isinstance(path, str) or not path or "\x00" in path:
+        return None
+    if not os.path.isabs(path):
+        return None
+    norm = os.path.normpath(path)
+    parent, base = os.path.split(norm)
+    try:
+        cfg_real = os.path.realpath(CONFIG_DIR)
+        parent_real = os.path.realpath(parent)
+    except OSError:
+        return None
+    if parent_real != cfg_real:
+        return None
+    if not base.startswith(FLOORPLAN_BG_PREFIX):
+        return None
+    _, ext = os.path.splitext(base.lower())
+    if ext not in FLOORPLAN_BG_EXTS:
+        return None
+    try:
+        fd = os.open(norm, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            return None
+        if info.st_size <= 0 or info.st_size > MAX_FLOORPLAN_BG_BYTES:
+            return None
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    return norm
+
+
+def _valid_fp_resource_id(value):
+    if valid_uuid(value):
+        return True
+    mod = _PROVIDERS_MOD or _load_providers_module()
+    if mod is not None and mod.valid_resource_id(value):
+        return True
+    return False
+
+
+def _validate_floor_id(value, default="eg"):
+    if value is None or value == "":
+        return default
+    if isinstance(value, str) and FLOOR_ID_RE.match(value.lower()):
+        return value.lower()
+    return None
+
+
+def _validate_polygon_points(raw_pts, min_pts=3, max_pts=MAX_FLOORPLAN_POLYGON_PTS):
+    if raw_pts is None:
+        return []
+    if not isinstance(raw_pts, list):
+        return None
+    if len(raw_pts) == 0:
+        return []
+    if len(raw_pts) < min_pts or len(raw_pts) > max_pts:
+        return None
+    out = []
+    for p in raw_pts:
+        if not isinstance(p, dict):
+            return None
+        px = _strict_finite(p.get("x"), -200.0, 4200.0)
+        py = _strict_finite(p.get("y"), -200.0, 3200.0)
+        if px is None or py is None:
+            return None
+        out.append({"x": round(px, 1), "y": round(py, 1)})
+    return out
+
+
+def validate_floorplan(raw):
+    """Strictly validate and normalize a floorplan.json payload (v1 & v2), or return None."""
+    if not isinstance(raw, dict):
+        return None
+    version = raw.get("version", FLOORPLAN_VERSION)
+    if isinstance(version, bool) or not isinstance(version, int) or version not in FLOORPLAN_VERSIONS:
+        return None
+
+    raw_bid = raw.get("bridge_id", "")
+    if raw_bid is None or raw_bid == "":
+        bridge_id = ""
+    elif isinstance(raw_bid, str) and BRIDGE_ID_RE.match(raw_bid.upper()):
+        bridge_id = raw_bid.upper()
+    else:
+        return None
+
+    raw_tid = raw.get("template_id", "auto_bridge")
+    if raw_tid is None or raw_tid == "":
+        template_id = "auto_bridge"
+    elif isinstance(raw_tid, str) and raw_tid in (FLOORPLAN_TEMPLATES + ("custom",)):
+        template_id = raw_tid
+    else:
+        return None
+
+    raw_ent = raw.get("entertainment_id")
+    if raw_ent is None or raw_ent == "":
+        entertainment_id = None
+    elif valid_uuid(raw_ent):
+        entertainment_id = raw_ent
+    else:
+        return None
+
+    raw_canvas = raw.get("canvas", {})
+    if not isinstance(raw_canvas, dict):
+        return None
+    c_width = _strict_finite(raw_canvas.get("width", 1600.0), 400.0, 4000.0)
+    c_height = _strict_finite(raw_canvas.get("height", 1000.0), 300.0, 3000.0)
+    c_grid = _strict_finite(raw_canvas.get("grid", 20.0), 5.0, 100.0)
+    c_snap = raw_canvas.get("snap", True)
+    c_zoom = _strict_finite(raw_canvas.get("zoom", 1.0), 0.25, 4.0)
+    c_pan_x = _strict_finite(raw_canvas.get("pan_x", 0.0), -4000.0, 4000.0)
+    c_pan_y = _strict_finite(raw_canvas.get("pan_y", 0.0), -4000.0, 4000.0)
+    if (c_width is None or c_height is None or c_grid is None or not isinstance(c_snap, bool)
+            or c_zoom is None or c_pan_x is None or c_pan_y is None):
+        return None
+    canvas = {
+        "width": round(c_width, 1),
+        "height": round(c_height, 1),
+        "grid": int(round(c_grid)),
+        "snap": c_snap,
+        "zoom": round(c_zoom, 3),
+        "pan_x": round(c_pan_x, 1),
+        "pan_y": round(c_pan_y, 1),
+    }
+
+    show_wires = raw.get("show_wires", True)
+    show_glows = raw.get("show_glows", True)
+    show_furniture = raw.get("show_furniture", True)
+    has_auto_sync = "auto_sync" in raw
+    has_auto_sync_rooms = "auto_sync_rooms" in raw
+    if has_auto_sync and not isinstance(raw["auto_sync"], bool):
+        return None
+    if has_auto_sync_rooms and not isinstance(raw["auto_sync_rooms"], bool):
+        return None
+    if has_auto_sync and has_auto_sync_rooms:
+        auto_sync = raw["auto_sync"]
+        auto_sync_rooms = raw["auto_sync_rooms"]
+    elif has_auto_sync:
+        auto_sync = raw["auto_sync"]
+        auto_sync_rooms = auto_sync
+    elif has_auto_sync_rooms:
+        auto_sync_rooms = raw["auto_sync_rooms"]
+        auto_sync = auto_sync_rooms
+    else:
+        auto_sync = False
+        auto_sync_rooms = False
+    if not (isinstance(show_wires, bool) and isinstance(show_glows, bool) and isinstance(show_furniture, bool)):
+        return None
+
+    px_per_meter = _strict_finite(raw.get("px_per_meter", 50.0), 20.0, 200.0)
+    if px_per_meter is None:
+        return None
+
+    raw_floors = raw.get("floors")
+    floors = []
+    if raw_floors is None:
+        floors = [{"id": "eg", "name": "Ground Floor", "level": 0}]
+    else:
+        if not isinstance(raw_floors, list) or len(raw_floors) > MAX_FLOORPLAN_FLOORS:
+            return None
+        seen_fids = set()
+        for f in raw_floors:
+            if not isinstance(f, dict):
+                return None
+            fid = _validate_floor_id(f.get("id"), "")
+            if not fid or fid in seen_fids:
+                return None
+            seen_fids.add(fid)
+            fname_raw = f.get("name", "Floor")
+            if not isinstance(fname_raw, str) or any(ch in fname_raw for ch in "<>&"):
+                return None
+            fname = clean(fname_raw, 32) or "Floor"
+            flevel = f.get("level", 0)
+            if isinstance(flevel, bool) or not isinstance(flevel, int) or flevel < -5 or flevel > 20:
+                return None
+            floors.append({"id": fid, "name": fname, "level": flevel})
+        if not floors:
+            floors = [{"id": "eg", "name": "Ground Floor", "level": 0}]
+
+    floor_id_set = {f["id"] for f in floors}
+    active_floor_id = _validate_floor_id(raw.get("active_floor_id"), floors[0]["id"])
+    if active_floor_id is None or active_floor_id not in floor_id_set:
+        active_floor_id = floors[0]["id"]
+
+    raw_bg = raw.get("background")
+    if raw_bg is None:
+        background = {"path": "", "opacity": 0.35, "fit": "contain"}
+    else:
+        if not isinstance(raw_bg, dict):
+            return None
+        bg_opacity = _strict_finite(raw_bg.get("opacity", 0.35), 0.05, 1.0)
+        bg_fit = raw_bg.get("fit", "contain")
+        bg_path = raw_bg.get("path", "")
+        if bg_opacity is None or bg_fit not in FLOORPLAN_BG_FITS or not isinstance(bg_path, str):
+            return None
+        if bg_path:
+            validated_bg_path = _validate_managed_bg_path(bg_path)
+            if validated_bg_path is None:
+                return None
+            bg_path = validated_bg_path
+        background = {
+            "path": bg_path,
+            "opacity": round(bg_opacity, 3),
+            "fit": bg_fit,
+        }
+
+    raw_boxes = raw.get("boxes", [])
+    if not isinstance(raw_boxes, list) or len(raw_boxes) > MAX_FLOORPLAN_BOXES:
+        return None
+    boxes = []
+    seen_box_ids = set()
+    for b in raw_boxes:
+        if not isinstance(b, dict):
+            return None
+        bid = b.get("id")
+        if bid is None or bid == "":
+            bid = str(uuid.uuid4())
+        elif not isinstance(bid, str) or FLOORPLAN_ID_RE.match(bid) is None:
+            return None
+        if bid in seen_box_ids:
+            return None
+        seen_box_ids.add(bid)
+
+        bkind = b.get("kind")
+        if bkind not in ("room", "zone"):
+            return None
+        hue_id = b.get("hue_id")
+        if hue_id is None or hue_id == "":
+            hue_id = None
+        elif not _valid_fp_resource_id(hue_id):
+            return None
+
+        raw_name = b.get("name")
+        if not isinstance(raw_name, str):
+            return None
+        if any(ch in raw_name for ch in "<>&"):
+            return None
+        bname = clean(raw_name, 40)
+        if not bname:
+            return None
+
+        arch = b.get("archetype", "other")
+        if arch is None or arch == "":
+            arch = "other"
+        elif not isinstance(arch, str) or arch not in HUE_ARCHETYPES:
+            return None
+
+        bx = _strict_finite(b.get("x"), -200.0, 4000.0)
+        by = _strict_finite(b.get("y"), -200.0, 3000.0)
+        bw = _strict_finite(b.get("w"), 60.0, 4000.0)
+        bh = _strict_finite(b.get("h"), 60.0, 3000.0)
+        if bx is None or by is None or bw is None or bh is None:
+            return None
+
+        pts = _validate_polygon_points(b.get("points"))
+        if pts is None:
+            return None
+        if len(pts) >= 3:
+            xs = [p["x"] for p in pts]
+            ys = [p["y"] for p in pts]
+            bx = min(xs)
+            by = min(ys)
+            bw = max(60.0, max(xs) - bx)
+            bh = max(60.0, max(ys) - by)
+
+        bfid = _validate_floor_id(b.get("floor_id"), floors[0]["id"])
+        if bfid is None:
+            return None
+
+        ent_area_id = b.get("entertainment_area_id")
+        if ent_area_id is None or ent_area_id == "":
+            ent_area_id = None
+        elif not valid_uuid(ent_area_id):
+            return None
+
+        boxes.append({
+            "id": bid,
+            "kind": bkind,
+            "hue_id": hue_id,
+            "name": bname,
+            "archetype": arch,
+            "x": round(bx, 1),
+            "y": round(by, 1),
+            "w": round(bw, 1),
+            "h": round(bh, 1),
+            "entertainment_area_id": ent_area_id,
+            "points": pts,
+            "floor_id": bfid,
+        })
+
+    raw_stamps = raw.get("stamps", [])
+    if not isinstance(raw_stamps, list) or len(raw_stamps) > MAX_FLOORPLAN_STAMPS:
+        return None
+    stamps = []
+    seen_stamp_ids = set()
+    for s in raw_stamps:
+        if not isinstance(s, dict):
+            return None
+        sid = s.get("id")
+        if sid is None or sid == "":
+            sid = str(uuid.uuid4())
+        elif not isinstance(sid, str) or FLOORPLAN_ID_RE.match(sid) is None:
+            return None
+        if sid in seen_stamp_ids:
+            return None
+        seen_stamp_ids.add(sid)
+
+        skind = s.get("kind")
+        if skind not in FLOORPLAN_STAMP_KINDS:
+            return None
+        sx = _strict_finite(s.get("x"), 0.0, 4000.0)
+        sy = _strict_finite(s.get("y"), 0.0, 3000.0)
+        sw = _strict_finite(s.get("w"), 10.0, 1000.0)
+        sh = _strict_finite(s.get("h"), 10.0, 1000.0)
+        rot = s.get("rot", 0)
+        sfid = _validate_floor_id(s.get("floor_id"), floors[0]["id"])
+        if (sx is None or sy is None or sw is None or sh is None or sfid is None
+                or isinstance(rot, bool) or not isinstance(rot, int) or rot not in FLOORPLAN_STAMP_ROTS):
+            return None
+        stamps.append({
+            "id": sid,
+            "kind": skind,
+            "x": round(sx, 1),
+            "y": round(sy, 1),
+            "w": round(sw, 1),
+            "h": round(sh, 1),
+            "rot": rot,
+            "floor_id": sfid,
+        })
+
+    raw_lamps = raw.get("lamps", {})
+    if not isinstance(raw_lamps, dict) or len(raw_lamps) > MAX_FLOORPLAN_LAMPS:
+        return None
+    lamps = {}
+    for lid, lpos in raw_lamps.items():
+        if not _valid_fp_resource_id(lid) or not isinstance(lpos, dict):
+            return None
+        lx = _strict_finite(lpos.get("x"), 0.0, 4000.0)
+        ly = _strict_finite(lpos.get("y"), 0.0, 3000.0)
+        lz = _strict_finite(lpos.get("z", 0.0), -1.0, 1.0)
+        lfid = _validate_floor_id(lpos.get("floor_id"), floors[0]["id"])
+        if lx is None or ly is None or lz is None or lfid is None:
+            return None
+        raw_icon = lpos.get("icon", "bulb")
+        icon = _LAMP_ICON_ALIASES.get(raw_icon, raw_icon) if isinstance(raw_icon, str) else "bulb"
+        if icon not in LAMP_ICONS:
+            icon = "bulb"
+        lamps[lid] = {
+            "x": round(lx, 1),
+            "y": round(ly, 1),
+            "z": round(lz, 3),
+            "icon": icon,
+            "floor_id": lfid,
+        }
+
+    raw_sensors = raw.get("sensors", {})
+    if raw_sensors is None:
+        raw_sensors = {}
+    if not isinstance(raw_sensors, dict) or len(raw_sensors) > MAX_FLOORPLAN_SENSORS:
+        return None
+    sensors = {}
+    for sid, spos in raw_sensors.items():
+        if not _valid_fp_resource_id(sid) or not isinstance(spos, dict):
+            return None
+        sx = _strict_finite(spos.get("x"), 0.0, 4000.0)
+        sy = _strict_finite(spos.get("y"), 0.0, 3000.0)
+        sfid = _validate_floor_id(spos.get("floor_id"), floors[0]["id"])
+        if sx is None or sy is None or sfid is None:
+            return None
+        sensors[sid] = {
+            "x": round(sx, 1),
+            "y": round(sy, 1),
+            "floor_id": sfid,
+        }
+
+    raw_planned = raw.get("planned_lights", [])
+    if raw_planned is None:
+        raw_planned = []
+    if not isinstance(raw_planned, list) or len(raw_planned) > MAX_FLOORPLAN_PLANNED:
+        return None
+    planned_lights = []
+    seen_pids = set()
+    for pl in raw_planned:
+        if not isinstance(pl, dict):
+            return None
+        pid = pl.get("id")
+        if pid is None or pid == "":
+            pid = str(uuid.uuid4())
+        elif not isinstance(pid, str) or FLOORPLAN_ID_RE.match(pid) is None:
+            return None
+        if pid in seen_pids:
+            return None
+        seen_pids.add(pid)
+        pfid = _validate_floor_id(pl.get("floor_id"), floors[0]["id"])
+        if pfid is None:
+            return None
+        pname_raw = pl.get("name", "Planned Light")
+        if not isinstance(pname_raw, str) or any(ch in pname_raw for ch in "<>&"):
+            return None
+        pname = clean(pname_raw, 40) or "Planned Light"
+        picon = pl.get("icon", "bulb")
+        if not isinstance(picon, str):
+            return None
+        picon = _LAMP_ICON_ALIASES.get(picon, picon)
+        if picon not in LAMP_ICONS:
+            picon = "bulb"
+        px = _strict_finite(pl.get("x"), 0.0, 4000.0)
+        py = _strict_finite(pl.get("y"), 0.0, 3000.0)
+        if px is None or py is None:
+            return None
+        spts = _validate_polygon_points(pl.get("strip_points"), min_pts=2, max_pts=24)
+        if spts is None:
+            return None
+        plumens = _strict_finite(pl.get("lumens", 800), 50.0, 12000.0)
+        pradius = _strict_finite(pl.get("beam_radius", 2.6), 0.8, 8.0)
+        pkelvin = _strict_finite(pl.get("kelvin", 2700), 1800.0, 6500.0)
+        pprice = _strict_finite(pl.get("price", 0.0), 0.0, 100000.0)
+        pon = pl.get("on", True)
+        if plumens is None or pradius is None or pkelvin is None or pprice is None or not isinstance(pon, bool):
+            return None
+        pcol = pl.get("color", "#ffd27a")
+        if not isinstance(pcol, str) or not re.match(r"^#[0-9a-fA-F]{6}$", pcol):
+            pcol = "#ffd27a"
+        pnote_raw = pl.get("model_note", "")
+        if not isinstance(pnote_raw, str) or any(ch in pnote_raw for ch in "<>&"):
+            return None
+        planned_lights.append({
+            "id": pid,
+            "floor_id": pfid,
+            "name": pname,
+            "icon": picon,
+            "x": round(px, 1),
+            "y": round(py, 1),
+            "strip_points": spts,
+            "lumens": int(round(plumens)),
+            "beam_radius": round(pradius, 2),
+            "kelvin": int(round(pkelvin)),
+            "color": pcol.lower(),
+            "on": pon,
+            "model_note": clean(pnote_raw, 80),
+            "price": round(pprice, 2),
+        })
+
+    return {
+        "version": version,
+        "bridge_id": bridge_id,
+        "template_id": template_id,
+        "entertainment_id": entertainment_id,
+        "canvas": canvas,
+        "show_wires": show_wires,
+        "show_glows": show_glows,
+        "show_furniture": show_furniture,
+        "auto_sync": auto_sync,
+        "auto_sync_rooms": auto_sync_rooms,
+        "background": background,
+        "px_per_meter": round(px_per_meter, 2),
+        "floors": floors,
+        "active_floor_id": active_floor_id,
+        "boxes": boxes,
+        "stamps": stamps,
+        "lamps": lamps,
+        "sensors": sensors,
+        "planned_lights": planned_lights,
+    }
+
+
+_ARCHETYPE_ALIASES = {
+    "living_room": ("living_room", "lounge", "tv", "recreation", "music", "reading"),
+    "kitchen": ("kitchen", "dining"),
+    "dining": ("dining", "kitchen", "living_room"),
+    "bedroom": ("bedroom", "guest_room", "nursery"),
+    "kids_bedroom": ("kids_bedroom", "guest_room", "nursery", "bedroom"),
+    "office": ("office", "computer", "studio", "man_cave", "reading"),
+    "bathroom": ("bathroom", "toilet", "laundry_room"),
+    "toilet": ("toilet", "bathroom"),
+    "hallway": ("hallway", "front_door", "staircase", "closet", "storage"),
+    "balcony": ("balcony", "terrace", "porch", "garden"),
+    "terrace": ("terrace", "garden", "balcony", "porch", "barbecue", "pool"),
+}
+
+_ARCHETYPE_KEYWORDS = {
+    "living_room": ("living", "wohn", "salon", "salón", "soggiorno", "woonkamer", "lounge", "tv"),
+    "kitchen": ("kitchen", "küch", "kuech", "cuisine", "cocina", "cucina", "keuken", "kuchnia"),
+    "dining": ("dining", "ess", "manger", "comedor", "pranzo", "eetkamer", "jadalnia"),
+    "bedroom": ("bedroom", "schlaf", "master", "chambre", "dormitorio", "camera", "slaapkamer", "sypialnia"),
+    "kids_bedroom": ("kids", "kinder", "guest", "gäste", "gaste", "second", "zweit", "enfant", "niños"),
+    "office": ("office", "büro", "buero", "desk", "studio", "arbeit", "study", "bureau", "despacho", "ufficio", "kantoor", "biuro", "gaming", "computer"),
+    "bathroom": ("bath", "bad", "bain", "baño", "bagno", "badkamer", "łazienka", "lazienka", "shower", "dusche"),
+    "toilet": ("wc", "toilet", "restroom", "gäste-wc"),
+    "hallway": ("hall", "flur", "diele", "corridor", "entry", "eingang", "couloir", "pasillo", "gang", "przedpokój"),
+    "balcony": ("balcony", "balkon", "balcon", "balcón", "balcone"),
+    "terrace": ("terrace", "terrass", "garden", "garten", "patio", "outdoor", "jardin", "tuin", "ogród", "ogrod", "yard"),
+}
+
+
+def _place_lamps_in_box(box, lights, lamps_out):
+    """Distribute `lights` neatly inside `box` (strictly inside polygon walls) into `lamps_out`."""
+    valid_lights = [l for l in (lights or []) if isinstance(l, dict) and _valid_fp_resource_id(l.get("id"))]
+    if not valid_lights:
+        return
+    n = len(valid_lights)
+    cols = max(1, int(math.ceil(math.sqrt(n * (box["w"] / max(1.0, box["h"]))))))
+    rows = max(1, int(math.ceil(n / float(cols))))
+    pad_x = min(56.0, box["w"] * 0.2)
+    pad_y = min(56.0, box["h"] * 0.22)
+    inner_w = max(20.0, box["w"] - 2.0 * pad_x)
+    inner_h = max(20.0, box["h"] - 2.0 * pad_y)
+    fid = box.get("floor_id", "eg")
+    pts = box.get("points") or []
+    cx = sum(p["x"] for p in pts) / len(pts) if len(pts) >= 3 else (box["x"] + box["w"] * 0.5)
+    cy = sum(p["y"] for p in pts) / len(pts) if len(pts) >= 3 else (box["y"] + box["h"] * 0.5)
+    for idx, light in enumerate(valid_lights):
+        lid = light["id"]
+        if lid in lamps_out or len(lamps_out) >= MAX_FLOORPLAN_LAMPS:
+            continue
+        col = idx % cols
+        row = idx // cols
+        fx = 0.5 if cols == 1 else (col / float(cols - 1))
+        fy = 0.5 if rows == 1 else (row / float(rows - 1))
+        lx = box["x"] + pad_x + fx * inner_w
+        ly = box["y"] + pad_y + fy * inner_h
+        if not _point_in_box(lx, ly, box):
+            lx = cx + ((idx % 3) - 1) * 24.0
+            ly = cy + (idx // 3) * 24.0
+            if not _point_in_box(lx, ly, box):
+                lx, ly = cx, cy
+        lamps_out[lid] = {
+            "x": round(clamp(lx, 0.0, 4000.0), 1),
+            "y": round(clamp(ly, 0.0, 3000.0), 1),
+            "z": 0.0,
+            "icon": "bulb",
+            "floor_id": fid,
+        }
+
+
+def _template_blueprints():
+    """Return static pure-vector architectural starter blueprints (polygon rooms, multi-floor & stamps)."""
+    return {
+        "studio_loft": {
+            "canvas": {"width": 1200.0, "height": 820.0},
+            "floors": [{"id": "eg", "name": "Ground Floor", "level": 0}],
+            "boxes": [
+                {
+                    "id": "box-living", "kind": "room", "hue_id": None, "name": "Living / Sleeping", "archetype": "living_room",
+                    "x": 80.0, "y": 80.0, "w": 660.0, "h": 440.0, "entertainment_area_id": None, "floor_id": "eg",
+                    "points": [{"x": 80.0, "y": 80.0}, {"x": 740.0, "y": 80.0}, {"x": 740.0, "y": 320.0}, {"x": 540.0, "y": 320.0}, {"x": 540.0, "y": 520.0}, {"x": 80.0, "y": 520.0}],
+                },
+                {"id": "box-kitchen", "kind": "room", "hue_id": None, "name": "Kitchenette", "archetype": "kitchen", "x": 740.0, "y": 80.0, "w": 340.0, "h": 240.0, "entertainment_area_id": None, "floor_id": "eg"},
+                {"id": "box-bath", "kind": "room", "hue_id": None, "name": "Bathroom", "archetype": "bathroom", "x": 540.0, "y": 320.0, "w": 540.0, "h": 200.0, "entertainment_area_id": None, "floor_id": "eg"},
+                {"id": "box-balcony", "kind": "zone", "hue_id": None, "name": "Balcony", "archetype": "balcony", "x": 80.0, "y": 520.0, "w": 460.0, "h": 170.0, "entertainment_area_id": None, "floor_id": "eg"},
+            ],
+            "stamps": [
+                {"id": "st-1", "kind": "tv", "x": 160.0, "y": 95.0, "w": 160.0, "h": 18.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-2", "kind": "sofa", "x": 150.0, "y": 240.0, "w": 180.0, "h": 72.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-3", "kind": "bed", "x": 490.0, "y": 110.0, "w": 190.0, "h": 150.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-4", "kind": "desk", "x": 160.0, "y": 400.0, "w": 150.0, "h": 68.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-5", "kind": "kitchen", "x": 760.0, "y": 96.0, "w": 280.0, "h": 54.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-6", "kind": "dining", "x": 800.0, "y": 190.0, "w": 130.0, "h": 80.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-7", "kind": "door", "x": 740.0, "y": 390.0, "w": 52.0, "h": 52.0, "rot": 90, "floor_id": "eg"},
+                {"id": "st-8", "kind": "window", "x": 180.0, "y": 514.0, "w": 220.0, "h": 12.0, "rot": 0, "floor_id": "eg"},
+            ],
+        },
+        "one_bed_apt": {
+            "canvas": {"width": 1400.0, "height": 820.0},
+            "floors": [{"id": "eg", "name": "Ground Floor", "level": 0}],
+            "boxes": [
+                {
+                    "id": "box-living", "kind": "room", "hue_id": None, "name": "Living Room", "archetype": "living_room",
+                    "x": 80.0, "y": 80.0, "w": 460.0, "h": 360.0, "entertainment_area_id": None, "floor_id": "eg",
+                    "points": [{"x": 80.0, "y": 80.0}, {"x": 540.0, "y": 80.0}, {"x": 540.0, "y": 320.0}, {"x": 420.0, "y": 320.0}, {"x": 420.0, "y": 440.0}, {"x": 80.0, "y": 440.0}],
+                },
+                {"id": "box-kitchen", "kind": "room", "hue_id": None, "name": "Kitchen", "archetype": "kitchen", "x": 540.0, "y": 80.0, "w": 320.0, "h": 240.0, "entertainment_area_id": None, "floor_id": "eg"},
+                {"id": "box-hall", "kind": "room", "hue_id": None, "name": "Hallway", "archetype": "hallway", "x": 420.0, "y": 320.0, "w": 440.0, "h": 120.0, "entertainment_area_id": None, "floor_id": "eg"},
+                {"id": "box-bedroom", "kind": "room", "hue_id": None, "name": "Bedroom", "archetype": "bedroom", "x": 860.0, "y": 80.0, "w": 420.0, "h": 360.0, "entertainment_area_id": None, "floor_id": "eg"},
+                {"id": "box-bath", "kind": "room", "hue_id": None, "name": "Bathroom", "archetype": "bathroom", "x": 540.0, "y": 440.0, "w": 320.0, "h": 220.0, "entertainment_area_id": None, "floor_id": "eg"},
+                {"id": "box-balcony", "kind": "zone", "hue_id": None, "name": "Balcony", "archetype": "balcony", "x": 80.0, "y": 440.0, "w": 460.0, "h": 160.0, "entertainment_area_id": None, "floor_id": "eg"},
+            ],
+            "stamps": [
+                {"id": "st-1", "kind": "tv", "x": 180.0, "y": 94.0, "w": 160.0, "h": 18.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-2", "kind": "sofa", "x": 170.0, "y": 240.0, "w": 180.0, "h": 74.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-3", "kind": "kitchen", "x": 560.0, "y": 94.0, "w": 270.0, "h": 54.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-4", "kind": "dining", "x": 600.0, "y": 190.0, "w": 140.0, "h": 84.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-5", "kind": "bed", "x": 960.0, "y": 120.0, "w": 200.0, "h": 170.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-6", "kind": "door", "x": 540.0, "y": 350.0, "w": 52.0, "h": 52.0, "rot": 90, "floor_id": "eg"},
+                {"id": "st-7", "kind": "door", "x": 860.0, "y": 350.0, "w": 52.0, "h": 52.0, "rot": 270, "floor_id": "eg"},
+                {"id": "st-8", "kind": "window", "x": 180.0, "y": 434.0, "w": 200.0, "h": 12.0, "rot": 0, "floor_id": "eg"},
+            ],
+        },
+        "three_room_apt": {
+            "canvas": {"width": 1500.0, "height": 880.0},
+            "floors": [{"id": "eg", "name": "Ground Floor", "level": 0}],
+            "boxes": [
+                {
+                    "id": "box-living", "kind": "room", "hue_id": None, "name": "Living / Dining", "archetype": "living_room",
+                    "x": 80.0, "y": 50.0, "w": 520.0, "h": 390.0, "entertainment_area_id": None, "floor_id": "eg",
+                    "points": [
+                        {"x": 80.0, "y": 110.0}, {"x": 200.0, "y": 110.0}, {"x": 245.0, "y": 50.0},
+                        {"x": 435.0, "y": 50.0}, {"x": 480.0, "y": 110.0}, {"x": 600.0, "y": 110.0},
+                        {"x": 600.0, "y": 440.0}, {"x": 80.0, "y": 440.0},
+                    ],
+                },
+                {"id": "box-kitchen", "kind": "room", "hue_id": None, "name": "Kitchen", "archetype": "kitchen", "x": 600.0, "y": 110.0, "w": 300.0, "h": 210.0, "entertainment_area_id": None, "floor_id": "eg"},
+                {
+                    "id": "box-hall", "kind": "room", "hue_id": None, "name": "Hallway", "archetype": "hallway",
+                    "x": 600.0, "y": 320.0, "w": 420.0, "h": 120.0, "entertainment_area_id": None, "floor_id": "eg",
+                    "points": [
+                        {"x": 600.0, "y": 320.0}, {"x": 900.0, "y": 320.0}, {"x": 900.0, "y": 370.0},
+                        {"x": 1020.0, "y": 370.0}, {"x": 1020.0, "y": 440.0}, {"x": 600.0, "y": 440.0},
+                    ],
+                },
+                {"id": "box-master", "kind": "room", "hue_id": None, "name": "Master Bedroom", "archetype": "bedroom", "x": 900.0, "y": 110.0, "w": 460.0, "h": 260.0, "entertainment_area_id": None, "floor_id": "eg"},
+                {"id": "box-office", "kind": "room", "hue_id": None, "name": "Office / Studio", "archetype": "office", "x": 80.0, "y": 440.0, "w": 380.0, "h": 300.0, "entertainment_area_id": None, "floor_id": "eg"},
+                {"id": "box-bath", "kind": "room", "hue_id": None, "name": "Bathroom", "archetype": "bathroom", "x": 460.0, "y": 440.0, "w": 280.0, "h": 300.0, "entertainment_area_id": None, "floor_id": "eg"},
+                {"id": "box-second", "kind": "room", "hue_id": None, "name": "Second Bedroom", "archetype": "kids_bedroom", "x": 740.0, "y": 440.0, "w": 620.0, "h": 300.0, "entertainment_area_id": None, "floor_id": "eg"},
+            ],
+            "stamps": [
+                {"id": "st-1", "kind": "tv", "x": 120.0, "y": 124.0, "w": 160.0, "h": 18.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-2", "kind": "sofa", "x": 120.0, "y": 245.0, "w": 180.0, "h": 72.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-3", "kind": "dining", "x": 380.0, "y": 200.0, "w": 160.0, "h": 95.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-4", "kind": "kitchen", "x": 620.0, "y": 124.0, "w": 250.0, "h": 52.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-5", "kind": "bed", "x": 1020.0, "y": 135.0, "w": 200.0, "h": 165.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-6", "kind": "desk", "x": 150.0, "y": 510.0, "w": 170.0, "h": 74.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-7", "kind": "bed", "x": 960.0, "y": 510.0, "w": 170.0, "h": 140.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-8", "kind": "door", "x": 600.0, "y": 350.0, "w": 52.0, "h": 52.0, "rot": 90, "floor_id": "eg"},
+                {"id": "st-9", "kind": "window", "x": 250.0, "y": 46.0, "w": 180.0, "h": 12.0, "rot": 0, "floor_id": "eg"},
+            ],
+        },
+        "family_house": {
+            "canvas": {"width": 1600.0, "height": 900.0},
+            "floors": [
+                {"id": "eg", "name": "Ground Floor", "level": 0},
+                {"id": "og", "name": "Upper Floor", "level": 1},
+            ],
+            "boxes": [
+                {
+                    "id": "box-living", "kind": "room", "hue_id": None, "name": "Living / Dining", "archetype": "living_room",
+                    "x": 80.0, "y": 80.0, "w": 540.0, "h": 380.0, "entertainment_area_id": None, "floor_id": "eg",
+                    "points": [{"x": 80.0, "y": 80.0}, {"x": 620.0, "y": 80.0}, {"x": 620.0, "y": 340.0}, {"x": 480.0, "y": 340.0}, {"x": 480.0, "y": 460.0}, {"x": 80.0, "y": 460.0}],
+                },
+                {"id": "box-kitchen", "kind": "room", "hue_id": None, "name": "Kitchen", "archetype": "kitchen", "x": 620.0, "y": 80.0, "w": 360.0, "h": 260.0, "entertainment_area_id": None, "floor_id": "eg"},
+                {"id": "box-hall", "kind": "room", "hue_id": None, "name": "Hallway", "archetype": "hallway", "x": 480.0, "y": 340.0, "w": 500.0, "h": 120.0, "entertainment_area_id": None, "floor_id": "eg"},
+                {"id": "box-office", "kind": "room", "hue_id": None, "name": "Home Office", "archetype": "office", "x": 980.0, "y": 80.0, "w": 420.0, "h": 260.0, "entertainment_area_id": None, "floor_id": "eg"},
+                {"id": "box-wc", "kind": "room", "hue_id": None, "name": "Guest WC", "archetype": "toilet", "x": 980.0, "y": 340.0, "w": 240.0, "h": 120.0, "entertainment_area_id": None, "floor_id": "eg"},
+                {"id": "box-terrace", "kind": "zone", "hue_id": None, "name": "Terrace / Garden", "archetype": "terrace", "x": 80.0, "y": 460.0, "w": 900.0, "h": 260.0, "entertainment_area_id": None, "floor_id": "eg"},
+                # Upper Floor (OG)
+                {"id": "box-bed-og", "kind": "room", "hue_id": None, "name": "Master Bedroom", "archetype": "bedroom", "x": 80.0, "y": 80.0, "w": 460.0, "h": 340.0, "entertainment_area_id": None, "floor_id": "og"},
+                {"id": "box-bath-og", "kind": "room", "hue_id": None, "name": "Bathroom", "archetype": "bathroom", "x": 540.0, "y": 80.0, "w": 320.0, "h": 240.0, "entertainment_area_id": None, "floor_id": "og"},
+                {"id": "box-hall-og", "kind": "room", "hue_id": None, "name": "Gallery Hall", "archetype": "hallway", "x": 540.0, "y": 320.0, "w": 320.0, "h": 140.0, "entertainment_area_id": None, "floor_id": "og"},
+                {"id": "box-kids-og", "kind": "room", "hue_id": None, "name": "Guest Room", "archetype": "kids_bedroom", "x": 860.0, "y": 80.0, "w": 440.0, "h": 380.0, "entertainment_area_id": None, "floor_id": "og"},
+            ],
+            "stamps": [
+                {"id": "st-1", "kind": "tv", "x": 150.0, "y": 94.0, "w": 170.0, "h": 18.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-2", "kind": "sofa", "x": 140.0, "y": 240.0, "w": 190.0, "h": 74.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-3", "kind": "dining", "x": 390.0, "y": 175.0, "w": 170.0, "h": 100.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-4", "kind": "kitchen", "x": 640.0, "y": 94.0, "w": 310.0, "h": 54.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-5", "kind": "desk", "x": 1090.0, "y": 140.0, "w": 180.0, "h": 76.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-stairs-eg", "kind": "stairs", "x": 840.0, "y": 345.0, "w": 90.0, "h": 110.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-6", "kind": "door", "x": 760.0, "y": 410.0, "w": 52.0, "h": 52.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-7", "kind": "window", "x": 160.0, "y": 454.0, "w": 260.0, "h": 12.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-bed-og", "kind": "bed", "x": 140.0, "y": 140.0, "w": 200.0, "h": 170.0, "rot": 0, "floor_id": "og"},
+                {"id": "st-stairs-og", "kind": "stairs", "x": 650.0, "y": 335.0, "w": 90.0, "h": 110.0, "rot": 0, "floor_id": "og"},
+                {"id": "st-bed2-og", "kind": "bed", "x": 960.0, "y": 150.0, "w": 180.0, "h": 150.0, "rot": 0, "floor_id": "og"},
+            ],
+        },
+        "bungalow_l_shape": {
+            "canvas": {"width": 1440.0, "height": 840.0},
+            "floors": [{"id": "eg", "name": "Ground Floor", "level": 0}],
+            "boxes": [
+                {
+                    "id": "box-living", "kind": "room", "hue_id": None, "name": "Living / Dining", "archetype": "living_room",
+                    "x": 80.0, "y": 80.0, "w": 600.0, "h": 560.0, "entertainment_area_id": None, "floor_id": "eg",
+                    "points": [{"x": 80.0, "y": 80.0}, {"x": 680.0, "y": 80.0}, {"x": 680.0, "y": 400.0}, {"x": 420.0, "y": 400.0}, {"x": 420.0, "y": 640.0}, {"x": 80.0, "y": 640.0}],
+                },
+                {"id": "box-kitchen", "kind": "room", "hue_id": None, "name": "Kitchen", "archetype": "kitchen", "x": 680.0, "y": 80.0, "w": 280.0, "h": 320.0, "entertainment_area_id": None, "floor_id": "eg"},
+                {"id": "box-bedroom", "kind": "room", "hue_id": None, "name": "Bedroom", "archetype": "bedroom", "x": 960.0, "y": 80.0, "w": 360.0, "h": 320.0, "entertainment_area_id": None, "floor_id": "eg"},
+                {"id": "box-bath", "kind": "room", "hue_id": None, "name": "Bathroom", "archetype": "bathroom", "x": 960.0, "y": 400.0, "w": 360.0, "h": 240.0, "entertainment_area_id": None, "floor_id": "eg"},
+                {"id": "box-terrace", "kind": "zone", "hue_id": None, "name": "Courtyard Terrace", "archetype": "terrace", "x": 420.0, "y": 400.0, "w": 540.0, "h": 240.0, "entertainment_area_id": None, "floor_id": "eg"},
+            ],
+            "stamps": [
+                {"id": "st-1", "kind": "tv", "x": 150.0, "y": 95.0, "w": 170.0, "h": 18.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-2", "kind": "sofa", "x": 145.0, "y": 230.0, "w": 185.0, "h": 72.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-3", "kind": "dining", "x": 155.0, "y": 470.0, "w": 165.0, "h": 95.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-4", "kind": "kitchen", "x": 700.0, "y": 96.0, "w": 230.0, "h": 54.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-5", "kind": "bed", "x": 1040.0, "y": 130.0, "w": 190.0, "h": 165.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-6", "kind": "dining", "x": 600.0, "y": 470.0, "w": 160.0, "h": 92.0, "rot": 0, "floor_id": "eg"},
+            ],
+        },
+        "desk_studio": {
+            "canvas": {"width": 1280.0, "height": 840.0},
+            "floors": [{"id": "eg", "name": "Ground Floor", "level": 0}],
+            "boxes": [
+                {"id": "box-studio", "kind": "room", "hue_id": None, "name": "Desk / Gaming Studio", "archetype": "office", "x": 140.0, "y": 90.0, "w": 980.0, "h": 640.0, "entertainment_area_id": None, "floor_id": "eg"},
+            ],
+            "stamps": [
+                {"id": "st-1", "kind": "desk", "x": 440.0, "y": 150.0, "w": 360.0, "h": 110.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-2", "kind": "tv", "x": 490.0, "y": 110.0, "w": 260.0, "h": 20.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-3", "kind": "sofa", "x": 470.0, "y": 540.0, "w": 280.0, "h": 95.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-4", "kind": "window", "x": 134.0, "y": 240.0, "w": 12.0, "h": 220.0, "rot": 90, "floor_id": "eg"},
+                {"id": "st-5", "kind": "door", "x": 1068.0, "y": 560.0, "w": 56.0, "h": 56.0, "rot": 180, "floor_id": "eg"},
+            ],
+        },
+    }
+
+
+def _room_matches_archetype_keyword(room_name, box_archetype):
+    low = (room_name or "").lower()
+    for kw in _ARCHETYPE_KEYWORDS.get(box_archetype, ()):
+        if kw in low:
+            return True
+    return False
+
+
+def _sample_planned_lights_for_boxes(boxes):
+    out = []
+    for idx, b in enumerate(boxes):
+        if b.get("kind") != "room":
+            continue
+        cx = round(b["x"] + b["w"] * 0.5, 1)
+        cy = round(b["y"] + b["h"] * 0.5, 1)
+        if not _point_in_box(cx, cy, b):
+            pts = b.get("points") or []
+            if len(pts) >= 3:
+                cx = round(sum(p["x"] for p in pts) / len(pts), 1)
+                cy = round(sum(p["y"] for p in pts) / len(pts), 1)
+        fid = b.get("floor_id", "eg")
+        arch = b.get("archetype", "other")
+        if arch == "living_room":
+            out.append({
+                "id": f"plan-pendant-{idx}", "floor_id": fid, "name": "Pendant",
+                "icon": "pendant", "x": cx, "y": cy, "strip_points": [],
+                "lumens": 1400, "beam_radius": 3.0, "kelvin": 2700, "color": "#ffd27a",
+                "on": True, "model_note": "Dimmable Warm Pendant", "price": 179.0,
+            })
+            out.append({
+                "id": f"plan-strip-{idx}", "floor_id": fid, "name": "Cove Lightstrip",
+                "icon": "strip", "x": round(b["x"] + 60.0, 1), "y": round(b["y"] + 42.0, 1),
+                "strip_points": [
+                    {"x": round(b["x"] + 40.0, 1), "y": round(b["y"] + 42.0, 1)},
+                    {"x": round(min(b["x"] + b["w"] - 40.0, b["x"] + 260.0), 1), "y": round(b["y"] + 42.0, 1)},
+                ],
+                "lumens": 1600, "beam_radius": 2.2, "kelvin": 2700, "color": "#ffd27a",
+                "on": True, "model_note": "WLED / Hue Gradient Strip 3m", "price": 79.0,
+            })
+        elif arch == "kitchen":
+            out.append({
+                "id": f"plan-kit-{idx}", "floor_id": fid, "name": "Counter Lightstrip",
+                "icon": "strip", "x": cx, "y": round(b["y"] + 46.0, 1),
+                "strip_points": [
+                    {"x": round(b["x"] + 36.0, 1), "y": round(b["y"] + 46.0, 1)},
+                    {"x": round(b["x"] + b["w"] - 36.0, 1), "y": round(b["y"] + 46.0, 1)},
+                ],
+                "lumens": 1800, "beam_radius": 2.2, "kelvin": 3500, "color": "#ffe8b8",
+                "on": True, "model_note": "Under-Cabinet LED 2m", "price": 69.0,
+            })
+        elif arch == "office":
+            out.append({
+                "id": f"plan-desk-{idx}", "floor_id": fid, "name": "Desk Task Light",
+                "icon": "desk", "x": cx, "y": cy, "strip_points": [],
+                "lumens": 1100, "beam_radius": 2.4, "kelvin": 4000, "color": "#ffe8b8",
+                "on": True, "model_note": "High-CRI Desk Bar", "price": 99.0,
+            })
+        else:
+            out.append({
+                "id": f"plan-ceil-{idx}", "floor_id": fid, "name": "Ceiling Light",
+                "icon": "ceiling", "x": cx, "y": cy, "strip_points": [],
+                "lumens": 1200, "beam_radius": 2.8, "kelvin": 2700, "color": "#ffd27a",
+                "on": True, "model_note": "Flush Ceiling Light", "price": 99.0,
+            })
+    return out
+
+
+def build_floorplan_template(template_id, rooms, bridge_id="", include_plan=False):
+    """Build one of the editable starter floorplan prototypes, auto-matching existing rooms."""
+    if template_id not in FLOORPLAN_TEMPLATES:
+        return None
+    rooms_list = [r for r in (rooms or []) if isinstance(r, dict)]
+    bridge_rooms = [r for r in rooms_list if r.get("kind") == "room" and _valid_fp_resource_id(r.get("id"))]
+    other_group = next((r for r in rooms_list if r.get("kind") == "other"), None)
+    clean_bid = bridge_id.upper() if isinstance(bridge_id, str) and BRIDGE_ID_RE.match(bridge_id.upper()) else ""
+
+    boxes = []
+    stamps = []
+    lamps = {}
+    floors = [{"id": "eg", "name": "Ground Floor", "level": 0}]
+
+    if template_id == "auto_bridge":
+        if not bridge_rooms:
+            box = {
+                "id": "box-room-1",
+                "kind": "room",
+                "hue_id": None,
+                "name": "Living Room",
+                "archetype": "living_room",
+                "x": 100.0,
+                "y": 100.0,
+                "w": 440.0,
+                "h": 320.0,
+                "entertainment_area_id": None,
+            }
+            boxes.append(box)
+            stamps.append({"id": "st-door-1", "kind": "door", "x": 290.0, "y": 392.0, "w": 52.0, "h": 52.0, "rot": 0})
+            c_w, c_h = 1400.0, 900.0
+        else:
+            count = min(len(bridge_rooms), MAX_FLOORPLAN_BOXES)
+            cols = 1 if count <= 1 else (2 if count <= 4 else 3)
+            box_w, box_h = 420.0, 300.0
+            margin_x, margin_y = 80.0, 80.0
+            for idx, room in enumerate(bridge_rooms[:MAX_FLOORPLAN_BOXES]):
+                col = idx % cols
+                row = idx // cols
+                arch = room.get("archetype") if room.get("archetype") in HUE_ARCHETYPES else "other"
+                bname = clean(room.get("name") or "Room", 40) or "Room"
+                bx = margin_x + col * box_w
+                by = margin_y + row * box_h
+                box = {
+                    "id": "box-%d" % (idx + 1),
+                    "kind": "room",
+                    "hue_id": room["id"],
+                    "name": bname,
+                    "archetype": arch,
+                    "x": bx,
+                    "y": by,
+                    "w": box_w,
+                    "h": box_h,
+                    "entertainment_area_id": None,
+                }
+                boxes.append(box)
+                if len(stamps) < MAX_FLOORPLAN_STAMPS:
+                    stamps.append({
+                        "id": "st-door-%d" % (idx + 1),
+                        "kind": "door",
+                        "x": round(bx + box_w * 0.5 - 26.0, 1),
+                        "y": round(by + box_h - 26.0, 1),
+                        "w": 52.0,
+                        "h": 52.0,
+                        "rot": 0,
+                    })
+                _place_lamps_in_box(box, room.get("lights"), lamps)
+            rows_used = int(math.ceil(count / float(cols)))
+            c_w = clamp(margin_x * 2.0 + cols * box_w, 1200.0, 4000.0)
+            c_h = clamp(margin_y * 2.0 + rows_used * box_h + 120.0, 860.0, 3000.0)
+    else:
+        bp = _template_blueprints()[template_id]
+        c_w = float(bp["canvas"]["width"])
+        c_h = float(bp["canvas"]["height"])
+        floors = [dict(f) for f in bp.get("floors", [{"id": "eg", "name": "Ground Floor", "level": 0}])]
+        boxes = [dict(b) for b in bp["boxes"]]
+        stamps = [dict(s) for s in bp["stamps"]]
+
+        matched_rooms = set()
+        matched_boxes = set()
+
+        def bind(box_idx, room):
+            matched_boxes.add(box_idx)
+            matched_rooms.add(room["id"])
+            box = boxes[box_idx]
+            box["hue_id"] = room["id"]
+            bname = clean(room.get("name") or "", 40)
+            if bname:
+                box["name"] = bname
+            if room.get("archetype") in HUE_ARCHETYPES:
+                box["archetype"] = room["archetype"]
+            _place_lamps_in_box(box, room.get("lights"), lamps)
+
+        # Pass 1: exact archetype match
+        for bi, box in enumerate(boxes):
+            if bi in matched_boxes:
+                continue
+            for room in bridge_rooms:
+                if room["id"] not in matched_rooms and room.get("archetype") == box["archetype"]:
+                    bind(bi, room)
+                    break
+
+        # Pass 2: multilingual keyword match on room name
+        for bi, box in enumerate(boxes):
+            if bi in matched_boxes:
+                continue
+            for room in bridge_rooms:
+                if room["id"] not in matched_rooms and _room_matches_archetype_keyword(room.get("name"), box["archetype"]):
+                    bind(bi, room)
+                    break
+
+        # Pass 3: archetype alias match (e.g. lounge -> living_room, studio -> office, garden -> terrace)
+        for bi, box in enumerate(boxes):
+            if bi in matched_boxes:
+                continue
+            aliases = _ARCHETYPE_ALIASES.get(box["archetype"], ())
+            for room in bridge_rooms:
+                if room["id"] not in matched_rooms and room.get("archetype") in aliases:
+                    bind(bi, room)
+                    break
+
+        # Pass 4: remaining unmatched Hue rooms -> remaining empty boxes
+        for bi, box in enumerate(boxes):
+            if bi in matched_boxes:
+                continue
+            for room in bridge_rooms:
+                if room["id"] not in matched_rooms:
+                    bind(bi, room)
+                    break
+
+        # Pass 5: overflow Hue rooms beyond template box count -> tidy extra boxes along bottom
+        extra_rooms = [r for r in bridge_rooms if r["id"] not in matched_rooms]
+        if extra_rooms:
+            max_y = max((b["y"] + b["h"] for b in boxes), default=80.0)
+            extra_y = min(max_y + 40.0, 2600.0)
+            extra_w, extra_h = 340.0, 240.0
+            for ei, room in enumerate(extra_rooms):
+                if len(boxes) >= MAX_FLOORPLAN_BOXES:
+                    break
+                bx = clamp(80.0 + ei * (extra_w + 20.0), 0.0, 3600.0)
+                arch = room.get("archetype") if room.get("archetype") in HUE_ARCHETYPES else "other"
+                bname = clean(room.get("name") or "Room", 40) or "Room"
+                box = {
+                    "id": "box-extra-%d" % (ei + 1),
+                    "kind": "room",
+                    "hue_id": room["id"],
+                    "name": bname,
+                    "archetype": arch,
+                    "x": bx,
+                    "y": extra_y,
+                    "w": extra_w,
+                    "h": extra_h,
+                    "entertainment_area_id": None,
+                }
+                boxes.append(box)
+                _place_lamps_in_box(box, room.get("lights"), lamps)
+            c_w = max(c_w, clamp(80.0 + len(extra_rooms) * (extra_w + 20.0) + 80.0, 1200.0, 4000.0))
+            c_h = max(c_h, clamp(extra_y + extra_h + 100.0, 820.0, 3000.0))
+
+    # Place any unassigned ("other") lights neatly outside boxes at the bottom edge
+    if other_group and other_group.get("lights"):
+        max_y = max((b["y"] + b["h"] for b in boxes), default=80.0)
+        loose_y = clamp(max_y + 60.0, 80.0, 2940.0)
+        for oi, light in enumerate(other_group["lights"]):
+            lid = light.get("id")
+            if valid_uuid(lid) and lid not in lamps and len(lamps) < MAX_FLOORPLAN_LAMPS:
+                lamps[lid] = {
+                    "x": round(clamp(120.0 + oi * 70.0, 40.0, 3960.0), 1),
+                    "y": round(loose_y, 1),
+                    "z": 0.0,
+                    "icon": "bulb",
+                }
+        c_h = max(c_h, clamp(loose_y + 80.0, 820.0, 3000.0))
+
+    fp = {
+        "version": FLOORPLAN_VERSION,
+        "bridge_id": clean_bid,
+        "template_id": template_id,
+        "entertainment_id": None,
+        "canvas": {
+            "width": round(c_w, 1),
+            "height": round(c_h, 1),
+            "grid": 20,
+            "snap": True,
+            "zoom": 1.0,
+            "pan_x": 0.0,
+            "pan_y": 0.0,
+        },
+        "show_wires": True,
+        "show_glows": True,
+        "show_furniture": True,
+        "auto_sync": False,
+        "auto_sync_rooms": False,
+        "background": {"path": "", "opacity": 0.35, "fit": "contain"},
+        "px_per_meter": 50.0,
+        "floors": floors,
+        "active_floor_id": floors[0]["id"],
+        "boxes": boxes,
+        "stamps": stamps,
+        "lamps": lamps,
+        "sensors": {},
+        "planned_lights": _sample_planned_lights_for_boxes(boxes) if include_plan else [],
+    }
+    return validate_floorplan(fp)
+
+
+def _point_in_box(lx, ly, box):
+    if not ((box["x"] - 0.5 <= lx <= box["x"] + box["w"] + 0.5) and (box["y"] - 0.5 <= ly <= box["y"] + box["h"] + 0.5)):
+        return False
+    pts = box.get("points")
+    if not isinstance(pts, list) or len(pts) < 3:
+        return (box["x"] <= lx <= box["x"] + box["w"]) and (box["y"] <= ly <= box["y"] + box["h"])
+    n = len(pts)
+    inside = False
+    j = n - 1
+    for i in range(n):
+        xi, yi = pts[i]["x"], pts[i]["y"]
+        xj, yj = pts[j]["x"], pts[j]["y"]
+        # Inclusive edge check
+        dx, dy = xj - xi, yj - yi
+        l2 = dx * dx + dy * dy
+        t = 0.0 if l2 < 1e-9 else max(0.0, min(1.0, ((lx - xi) * dx + (ly - yi) * dy) / l2))
+        if math.hypot(lx - (xi + t * dx), ly - (yi + t * dy)) <= 1.5:
+            return True
+        if ((yi > ly) != (yj > ly)) and (lx < (xj - xi) * (ly - yi) / ((yj - yi) or 1e-9) + xi):
+            inside = not inside
+        j = i
+    return inside
+
+
+def _box_area(box):
+    pts = box.get("points")
+    if not isinstance(pts, list) or len(pts) < 3:
+        return max(1.0, float(box["w"]) * float(box["h"]))
+    s = 0.0
+    n = len(pts)
+    for i in range(n):
+        a = pts[i]
+        b = pts[(i + 1) % n]
+        s += a["x"] * b["y"] - b["x"] * a["y"]
+    return max(1.0, abs(s) * 0.5)
+
+
+def compute_room_membership_diffs(floorplan, rooms):
+    """Spatial point-in-box check returning [{light_id, device_id, from_room_id, to_room_id, to_box_id}].
+
+    Each placed lamp whose center lies inside a `kind == 'room'` box linked to a different Hue room
+    (or an unlinked room box) is reported. Overlapping room boxes prefer the smallest area box.
+    """
+    if not isinstance(floorplan, dict) or not isinstance(rooms, list):
+        return []
+    light_info = {}  # light_id -> (device_id, from_room_id)
+    for room in rooms:
+        if not isinstance(room, dict) or room.get("kind") == "zone":
+            continue
+        from_rid = room["id"] if room.get("kind") == "room" and valid_uuid(room.get("id")) else ""
+        for light in room.get("lights") or []:
+            if not isinstance(light, dict) or not valid_uuid(light.get("id")):
+                continue
+            lid = light["id"]
+            if lid not in light_info or (not light_info[lid][1] and from_rid):
+                did = light.get("device_id") if valid_uuid(light.get("device_id")) else ""
+                light_info[lid] = (did, from_rid)
+
+    room_boxes = [
+        b for b in (floorplan.get("boxes") or [])
+        if isinstance(b, dict) and b.get("kind") == "room"
+    ]
+    diffs = []
+    for lid, lpos in sorted((floorplan.get("lamps") or {}).items()):
+        if lid not in light_info or not isinstance(lpos, dict):
+            continue
+        lx, ly = lpos.get("x"), lpos.get("y")
+        if lx is None or ly is None:
+            continue
+        lfloor = lpos.get("floor_id") or "eg"
+        containing = [
+            b for b in room_boxes
+            if (b.get("floor_id") or "eg") == lfloor and _point_in_box(lx, ly, b)
+        ]
+        if not containing:
+            continue
+        # Prefer smallest-area containing box; on shared-wall tie keep current Hue room
+        device_id, from_room_id = light_info[lid]
+        target_box = min(containing, key=lambda b: (_box_area(b), 0 if b.get("hue_id") == from_room_id else 1))
+        to_room_id = target_box.get("hue_id") or ""
+        if to_room_id != from_room_id:
+            diffs.append({
+                "light_id": lid,
+                "device_id": device_id,
+                "from_room_id": from_room_id,
+                "to_room_id": to_room_id,
+                "to_box_id": target_box["id"],
+            })
+    return diffs
+
+
+def compute_entertainment_positions(box, floorplan, rooms=None):
+    """Normalize placed lamps inside `box` to Hue Entertainment coordinates:
+    x in [-1.0, 1.0] (left -> right), y in [0.0, 1.0] (bottom -> top/front TV wall), z in [-1.0, 1.0]."""
+    if not isinstance(box, dict) or not isinstance(floorplan, dict):
+        return []
+    bx, by, bw, bh = box.get("x", 0.0), box.get("y", 0.0), box.get("w", 0.0), box.get("h", 0.0)
+    if bw <= 0 or bh <= 0:
+        return []
+    known_lights = None
+    if isinstance(rooms, list) and rooms:
+        known_lights = {
+            l["id"] for r in rooms if isinstance(r, dict)
+            for l in (r.get("lights") or []) if isinstance(l, dict) and valid_uuid(l.get("id"))
+        }
+    out = []
+    for lid, lpos in sorted((floorplan.get("lamps") or {}).items()):
+        if not valid_uuid(lid) or not isinstance(lpos, dict):
+            continue
+        if known_lights is not None and lid not in known_lights:
+            continue
+        lx, ly = lpos.get("x"), lpos.get("y")
+        if lx is None or ly is None or not _point_in_box(lx, ly, box):
+            continue
+        nx = round(clamp(((lx - bx) / float(bw)) * 2.0 - 1.0, -1.0, 1.0), 4)
+        ny = round(clamp(1.0 - ((ly - by) / float(bh)), 0.0, 1.0), 4)
+        nz = round(clamp(float(lpos.get("z", 0.0)), -1.0, 1.0), 4)
+        out.append({"light_id": lid, "x": nx, "y": ny, "z": nz})
+    return out
+
+
+def _build_entertainment_service_locations(area, positions, light_to_ent_service):
+    """Map normalized `positions` onto CLIP v2 `service_locations` using known entertainment service UUIDs."""
+    area_svc_by_light = {}
+    for loc in area.get("locations") or []:
+        if valid_uuid(loc.get("light_id")) and valid_uuid(loc.get("service_id")):
+            area_svc_by_light[loc["light_id"]] = (loc["service_id"], loc.get("service_type") or "entertainment")
+    service_locations = []
+    seen_svcs = set()
+    for pos in positions:
+        lid = pos["light_id"]
+        if lid in area_svc_by_light:
+            svc_id, svc_type = area_svc_by_light[lid]
+        elif lid in light_to_ent_service:
+            svc_id, svc_type = light_to_ent_service[lid], "entertainment"
+        else:
+            continue
+        if svc_id in seen_svcs:
+            continue
+        seen_svcs.add(svc_id)
+        service_locations.append({
+            "service": {"rid": svc_id, "rtype": svc_type},
+            "positions": [{"x": pos["x"], "y": pos["y"], "z": pos["z"]}],
+        })
+    return service_locations
+
+
+def build_floorplan_sync_calls(
+    floorplan,
+    rooms,
+    entertainment_areas=None,
+    light_to_ent_service=None,
+    include_meta=False,
+    pending_box_ids=None,
+):
+    """Build ordered CLIP v2 API calls `(method, path, body)` (or 4-tuples with metadata when
+    `include_meta=True`) to sync ALL pending floorplan changes: room/zone creations, renames &
+    archetypes, lamp-to-room/zone membership (removing from old room before adding to new room to
+    respect Hue's 1-room-per-device rule), and linked Entertainment areas."""
+    if not isinstance(floorplan, dict) or not isinstance(rooms, list):
+        return []
+    entertainment_areas = entertainment_areas or []
+    light_to_ent_service = light_to_ent_service or {}
+    pending_box_ids = set(pending_box_ids or ())
+
+    known_rooms = {}  # id -> room dict (kind == "room")
+    known_zones = {}  # id -> room dict (kind == "zone")
+    room_devices = {}  # room_id -> [unique device_ids]
+    light_to_device = {}  # light_id -> device_id
+    light_to_room = {}  # light_id -> room_id
+    for r in rooms:
+        if not isinstance(r, dict):
+            continue
+        kind = r.get("kind")
+        rid = r.get("id")
+        if kind == "room" and valid_uuid(rid):
+            known_rooms[rid] = r
+            devs = []
+            seen_d = set()
+            for l in r.get("lights") or []:
+                lid = l.get("id")
+                did = l.get("device_id") if valid_uuid(l.get("device_id")) else ""
+                if valid_uuid(lid):
+                    light_to_room[lid] = rid
+                    if did:
+                        light_to_device[lid] = did
+                if did and did not in seen_d:
+                    seen_d.add(did)
+                    devs.append(did)
+            room_devices[rid] = devs
+        elif kind == "zone" and valid_uuid(rid):
+            known_zones[rid] = r
+            for l in r.get("lights") or []:
+                lid = l.get("id")
+                did = l.get("device_id") if valid_uuid(l.get("device_id")) else ""
+                if valid_uuid(lid) and did:
+                    light_to_device.setdefault(lid, did)
+        elif kind == "other":
+            for l in r.get("lights") or []:
+                lid = l.get("id")
+                did = l.get("device_id") if valid_uuid(l.get("device_id")) else ""
+                if valid_uuid(lid) and did:
+                    light_to_device.setdefault(lid, did)
+
+    lamps = floorplan.get("lamps") or {}
+    boxes = floorplan.get("boxes") or []
+
+    # 1. Room metadata changes & new room boxes
+    room_meta_updates = {}  # room_id -> {"name": ..., "archetype": ...}
+    new_room_boxes = []
+    for box in boxes:
+        if box.get("kind") != "room":
+            continue
+        hid = box.get("hue_id")
+        if hid is None:
+            new_room_boxes.append(box)
+        elif hid in known_rooms:
+            existing = known_rooms[hid]
+            bname = clean(box.get("name") or "", 32)
+            ename = clean(existing.get("name") or "", 32)
+            barch = box.get("archetype") or "other"
+            earch = existing.get("archetype") or ""
+            meta = {}
+            if bname and bname != ename:
+                meta["name"] = bname
+            if barch in HUE_ARCHETYPES and barch != earch and (earch or barch != "other"):
+                meta["archetype"] = barch
+            if meta:
+                room_meta_updates[hid] = meta
+
+    # 2. Compute device moves between existing rooms and into new room boxes
+    diffs = compute_room_membership_diffs(floorplan, rooms)
+    removals = {}  # from_room_id -> set(device_ids)
+    additions = {}  # to_room_id -> [device_ids]
+    new_box_devices = {}  # box_id -> [device_ids]
+    moved_devices = set()
+    new_box_ids = {b["id"] for b in new_room_boxes}
+
+    for d in diffs:
+        did = d.get("device_id")
+        if not valid_uuid(did) or did in moved_devices:
+            continue
+        from_rid = d.get("from_room_id") or ""
+        to_rid = d.get("to_room_id") or ""
+        to_bid = d.get("to_box_id") or ""
+        if valid_uuid(to_rid) and to_rid in known_rooms:
+            moved_devices.add(did)
+            if valid_uuid(from_rid) and from_rid in known_rooms:
+                removals.setdefault(from_rid, set()).add(did)
+            additions.setdefault(to_rid, []).append(did)
+        elif not to_rid and to_bid in new_box_ids:
+            moved_devices.add(did)
+            if valid_uuid(from_rid) and from_rid in known_rooms:
+                removals.setdefault(from_rid, set()).add(did)
+            new_box_devices.setdefault(to_bid, []).append(did)
+
+    # Also include unassigned ("other") lamps placed inside newly-drawn unlinked room boxes (same floor only)
+    for box in new_room_boxes:
+        bfloor = box.get("floor_id") or "eg"
+        for lid, lpos in sorted(lamps.items()):
+            if lid in light_to_room or lid not in light_to_device:
+                continue
+            did = light_to_device[lid]
+            if did in moved_devices:
+                continue
+            if (lpos.get("floor_id") or "eg") == bfloor and _point_in_box(lpos["x"], lpos["y"], box):
+                moved_devices.add(did)
+                new_box_devices.setdefault(box["id"], []).append(did)
+
+    calls = []
+    meta_emitted_rooms = set()
+    orig_room_devices = {rid: list(devs) for rid, devs in room_devices.items()}
+
+    def _emit_call(method, path, body, meta=None):
+        if include_meta:
+            calls.append((method, path, body, meta or {}))
+        else:
+            calls.append((method, path, body))
+
+    # Phase A: Removals from old rooms FIRST (respects Hue 1-room-per-device rule)
+    for rid in sorted(removals):
+        rem = removals[rid]
+        kept = [d for d in room_devices.get(rid, []) if d not in rem]
+        room_devices[rid] = kept
+        body = {"children": [{"rid": d, "rtype": "device"} for d in kept]}
+        if rid in room_meta_updates and rid not in additions:
+            body["metadata"] = room_meta_updates[rid]
+            meta_emitted_rooms.add(rid)
+        rollback_body = {"children": [{"rid": d, "rtype": "device"} for d in orig_room_devices.get(rid, [])]}
+        _emit_call(
+            "PUT",
+            "/clip/v2/resource/room/%s" % rid,
+            body,
+            {"rollback": ("PUT", "/clip/v2/resource/room/%s" % rid, rollback_body)},
+        )
+
+    # Phase B1: Additions to existing rooms
+    for rid in sorted(additions):
+        updated = list(room_devices.get(rid, []))
+        for d in additions[rid]:
+            if d not in updated:
+                updated.append(d)
+        room_devices[rid] = updated
+        body = {"children": [{"rid": d, "rtype": "device"} for d in updated]}
+        if rid in room_meta_updates:
+            body["metadata"] = room_meta_updates[rid]
+            meta_emitted_rooms.add(rid)
+        _emit_call("PUT", "/clip/v2/resource/room/%s" % rid, body)
+
+    # Phase B2: New rooms (POST) — skip boxes with a creation POST already in flight
+    for box in new_room_boxes:
+        if box["id"] in pending_box_ids:
+            continue
+        bname = clean(box.get("name") or "", 32)
+        if not bname:
+            continue
+        arch = box.get("archetype") if box.get("archetype") in HUE_ARCHETYPES else "other"
+        devs = new_box_devices.get(box["id"], [])
+        _emit_call(
+            "POST",
+            "/clip/v2/resource/room",
+            {
+                "metadata": {"name": bname, "archetype": arch},
+                "children": [{"rid": d, "rtype": "device"} for d in devs],
+            },
+            {"link_box_id": box["id"], "kind": "room"},
+        )
+
+    # Phase B3: Metadata-only updates for existing rooms
+    for rid in sorted(room_meta_updates):
+        if rid not in meta_emitted_rooms:
+            _emit_call("PUT", "/clip/v2/resource/room/%s" % rid, {"metadata": room_meta_updates[rid]})
+
+    # Phase C: Zones (existing PUT + new POST)
+    all_known_lights = set(light_to_room) | set(light_to_device)
+    for r in rooms:
+        for l in r.get("lights") or []:
+            if valid_uuid(l.get("id")):
+                all_known_lights.add(l["id"])
+
+    for box in boxes:
+        if box.get("kind") != "zone":
+            continue
+        hid = box.get("hue_id")
+        bname = clean(box.get("name") or "", 32)
+        arch = box.get("archetype") if box.get("archetype") in HUE_ARCHETYPES else "other"
+        bfloor = box.get("floor_id") or "eg"
+        placed_inside = [
+            lid for lid, lpos in sorted(lamps.items())
+            if lid in all_known_lights
+            and (lpos.get("floor_id") or "eg") == bfloor
+            and _point_in_box(lpos["x"], lpos["y"], box)
+        ]
+        if hid is None:
+            if not bname or box["id"] in pending_box_ids:
+                continue
+            _emit_call(
+                "POST",
+                "/clip/v2/resource/zone",
+                {
+                    "metadata": {"name": bname, "archetype": arch},
+                    "children": [{"rid": lid, "rtype": "light"} for lid in placed_inside],
+                },
+                {"link_box_id": box["id"], "kind": "zone"},
+            )
+        elif hid in known_zones:
+            existing = known_zones[hid]
+            current_lights = [l["id"] for l in (existing.get("lights") or []) if valid_uuid(l.get("id"))]
+            unplaced_existing = [lid for lid in current_lights if lid not in lamps]
+            desired = []
+            for lid in unplaced_existing + placed_inside:
+                if lid not in desired:
+                    desired.append(lid)
+            body = {}
+            ename = clean(existing.get("name") or "", 32)
+            earch = existing.get("archetype") or ""
+            meta = {}
+            if bname and bname != ename:
+                meta["name"] = bname
+            if arch in HUE_ARCHETYPES and arch != earch and (earch or arch != "other"):
+                meta["archetype"] = arch
+            if meta:
+                body["metadata"] = meta
+            if set(desired) != set(current_lights):
+                body["children"] = [{"rid": lid, "rtype": "light"} for lid in desired]
+            if body:
+                _emit_call("PUT", "/clip/v2/resource/zone/%s" % hid, body)
+
+    # Phase D: Linked Entertainment Areas (per-box `entertainment_area_id` + top-level `entertainment_id`)
+    ent_by_id = {a["id"]: a for a in entertainment_areas if isinstance(a, dict) and valid_uuid(a.get("id"))}
+    synced_ent_ids = set()
+    for box in boxes:
+        aid = box.get("entertainment_area_id")
+        if not valid_uuid(aid) or aid not in ent_by_id or aid in synced_ent_ids:
+            continue
+        positions = compute_entertainment_positions(box, floorplan, rooms)
+        svc_locs = _build_entertainment_service_locations(ent_by_id[aid], positions, light_to_ent_service)
+        if svc_locs:
+            synced_ent_ids.add(aid)
+            _emit_call(
+                "PUT",
+                "/clip/v2/resource/entertainment_configuration/%s" % aid,
+                {"locations": {"service_locations": svc_locs}},
+            )
+
+    top_ent_id = floorplan.get("entertainment_id")
+    if valid_uuid(top_ent_id) and top_ent_id in ent_by_id and top_ent_id not in synced_ent_ids:
+        canvas = floorplan.get("canvas") or {}
+        if len(boxes) == 1:
+            ref_box = boxes[0]
+        else:
+            ref_box = {"x": 0.0, "y": 0.0, "w": float(canvas.get("width", 1600.0)), "h": float(canvas.get("height", 1000.0))}
+        positions = compute_entertainment_positions(ref_box, floorplan, rooms)
+        svc_locs = _build_entertainment_service_locations(ent_by_id[top_ent_id], positions, light_to_ent_service)
+        if svc_locs:
+            synced_ent_ids.add(top_ent_id)
+            _emit_call(
+                "PUT",
+                "/clip/v2/resource/entertainment_configuration/%s" % top_ent_id,
+                {"locations": {"service_locations": svc_locs}},
+            )
+
+    return calls
+
+
+_HANN_CACHE = {}
+
+
+def _hann_window(length):
+    win = _HANN_CACHE.get(length)
+    if win is None:
+        denom = float(length - 1) if length > 1 else 1.0
+        win = tuple(0.5 * (1.0 - math.cos(2.0 * math.pi * i / denom)) for i in range(length))
+        if len(_HANN_CACHE) < 32:
+            _HANN_CACHE[length] = win
+    return win
+
+
+def _goertzel_mag(samples, freq, sample_rate, block_len=None):
+    """Hann-windowed Goertzel RMS magnitude normalized to ~1.0 for a unit-amplitude sine."""
+    n = len(samples)
+    if n == 0 or sample_rate <= 0 or freq <= 0 or freq >= sample_rate * 0.5:
+        return 0.0
+    m = n if block_len is None else min(n, max(8, int(block_len)))
+    if m < 4:
+        return 0.0
+    omega = 2.0 * math.pi * freq / sample_rate
+    coeff = 2.0 * math.cos(omega)
+    win = _hann_window(m)
+    norm = m * 0.25
+    norm_sq = norm * norm
+    acc = 0.0
+    blocks = 0
+    for start in range(0, n - m + 1, m):
+        s1 = 0.0
+        s2 = 0.0
+        for i in range(m):
+            s0 = samples[start + i] * win[i] + coeff * s1 - s2
+            s2 = s1
+            s1 = s0
+        power = s1 * s1 + s2 * s2 - coeff * s1 * s2
+        if power > 0.0:
+            acc += power / norm_sq
+        blocks += 1
+    return math.sqrt(acc / blocks) if blocks else 0.0
+
+
+def analyze_pcm_bands(samples, sample_rate=16000):
+    """Pure-Python constant-Q Goertzel energy across Bass, Mids, and Treble -> (bass, mids, treble) in 0..1."""
+    if not samples or sample_rate <= 0:
+        return (0.0, 0.0, 0.0)
+    if isinstance(samples, (bytes, bytearray, memoryview)):
+        count = len(samples) // 2
+        if count == 0:
+            return (0.0, 0.0, 0.0)
+        raw = struct.unpack("<%dh" % count, samples[:count * 2])
+        norm = [v / 32768.0 for v in raw]
+    else:
+        norm = [float(v) for v in samples]
+        if not norm:
+            return (0.0, 0.0, 0.0)
+        peak = max(abs(v) for v in norm)
+        if peak > 1.5:
+            norm = [v / 32768.0 for v in norm]
+
+    bass_block = max(64, int(round(sample_rate * 0.032)))   # 512 @ 16 kHz -> covers 30..200 Hz
+    mids_block = max(32, int(round(sample_rate * 0.006)))   #  96 @ 16 kHz -> covers 250..1800 Hz
+    treble_block = max(8, int(round(sample_rate * 0.001)))  #  16 @ 16 kHz -> covers 2000..8000 Hz
+
+    def band_energy(freqs, block_len):
+        total_sq = 0.0
+        for f in freqs:
+            m = _goertzel_mag(norm, f, sample_rate, block_len=block_len)
+            total_sq += m * m
+        return round(clamp(math.sqrt(total_sq), 0.0, 1.0), 4)
+
+    return (
+        band_energy(SYNTH_BASS_FREQS, bass_block),
+        band_energy(SYNTH_MIDS_FREQS, mids_block),
+        band_energy(SYNTH_TREBLE_FREQS, treble_block),
+    )
+
+
+class AudioBeatTracker:
+    """Rolling energy history + beat detector + exponential band smoother."""
+
+    def __init__(self, history_size=24, beat_ratio=1.35, beat_floor=0.12, min_beat_gap=0.22):
+        self.history = []
+        self.history_size = max(4, int(history_size))
+        self.beat_ratio = float(beat_ratio)
+        self.beat_floor = float(beat_floor)
+        self.min_beat_gap = float(min_beat_gap)
+        self.bass = 0.0
+        self.mids = 0.0
+        self.treble = 0.0
+        self.last_beat = -1e9
+
+    def reset(self):
+        self.history.clear()
+        self.bass = 0.0
+        self.mids = 0.0
+        self.treble = 0.0
+        self.last_beat = -1e9
+
+    def update(self, bass, mids, treble, sensitivity=1.0, smoothness=0.45, now_mono=None):
+        sens = finite(sensitivity, 1.0, 0.2, 3.0)
+        smooth = finite(smoothness, 0.45, 0.0, 0.95)
+        now_mono = time.monotonic() if now_mono is None else float(now_mono)
+        b_in = clamp(finite(bass, 0.0, 0.0, 1.0) * sens, 0.0, 1.0)
+        m_in = clamp(finite(mids, 0.0, 0.0, 1.0) * sens, 0.0, 1.0)
+        t_in = clamp(finite(treble, 0.0, 0.0, 1.0) * sens, 0.0, 1.0)
+        energy = b_in * 0.65 + m_in * 0.25 + t_in * 0.10
+        avg = (sum(self.history) / len(self.history)) if self.history else energy
+        is_beat = (
+            len(self.history) >= 4
+            and energy >= self.beat_floor
+            and energy > avg * self.beat_ratio
+            and (now_mono - self.last_beat) >= self.min_beat_gap
+        )
+        if is_beat:
+            self.last_beat = now_mono
+        self.history.append(energy)
+        if len(self.history) > self.history_size:
+            self.history.pop(0)
+        alpha = 1.0 - smooth
+        self.bass = self.bass * smooth + b_in * alpha
+        self.mids = self.mids * smooth + m_in * alpha
+        self.treble = self.treble * smooth + t_in * alpha
+        return (
+            round(clamp(self.bass, 0.0, 1.0), 4),
+            round(clamp(self.mids, 0.0, 1.0), 4),
+            round(clamp(self.treble, 0.0, 1.0), 4),
+            bool(is_beat),
+        )
+
+
+def demo_beat_levels(elapsed_sec, bpm=120.0):
+    """Synthesize musical (bass, mids, treble, is_beat) levels with zero audio hardware."""
+    t = max(0.0, finite(elapsed_sec, 0.0, 0.0, 1e9))
+    bpm = finite(bpm, 120.0, 40.0, 240.0)
+    beat_period = 60.0 / bpm
+    beat_pos = (t % beat_period) / beat_period
+    bar_pos = (t % (beat_period * 4.0)) / (beat_period * 4.0)
+    bass = clamp(math.exp(-beat_pos * 5.5) * 0.92 + 0.08, 0.0, 1.0)
+    snare_pos = ((bar_pos * 4.0) - 1.0) % 2.0
+    snare = math.exp(-snare_pos * 6.0) * 0.45
+    mids = clamp(0.32 + 0.28 * math.sin(bar_pos * 2.0 * math.pi) + snare, 0.0, 1.0)
+    hat_pos = (beat_pos * 2.0) % 1.0
+    treble = clamp(math.exp(-hat_pos * 6.5) * 0.65 + 0.12 + 0.15 * abs(math.sin(t * 3.1)), 0.0, 1.0)
+    is_beat = beat_pos < 0.18
+    return (round(bass, 4), round(mids, 4), round(treble, 4), is_beat)
+
+
+def _lerp_hex(c1, c2, t):
+    t = clamp(float(t), 0.0, 1.0)
+    r1, g1, b1 = int(c1[1:3], 16), int(c1[3:5], 16), int(c1[5:7], 16)
+    r2, g2, b2 = int(c2[1:3], 16), int(c2[3:5], 16), int(c2[5:7], 16)
+    r = int(round(r1 + (r2 - r1) * t))
+    g = int(round(g1 + (g2 - g1) * t))
+    b = int(round(b1 + (b2 - b1) * t))
+    return "#%02x%02x%02x" % (clamp(r, 0, 255), clamp(g, 0, 255), clamp(b, 0, 255))
+
+
+def map_synth_frame(light_index, levels, mode, palette, band, sensitivity, smoothness, phase):
+    """Map audio band levels + light index into {bri: 1..100, xy: [x, y], hex: '#rrggbb'}."""
+    if isinstance(levels, dict):
+        bass = finite(levels.get("bass"), 0.0, 0.0, 1.0)
+        mids = finite(levels.get("mids"), 0.0, 0.0, 1.0)
+        treble = finite(levels.get("treble"), 0.0, 0.0, 1.0)
+        is_beat = bool(levels.get("beat", False))
+    elif isinstance(levels, (list, tuple)) and len(levels) >= 3:
+        bass = finite(levels[0], 0.0, 0.0, 1.0)
+        mids = finite(levels[1], 0.0, 0.0, 1.0)
+        treble = finite(levels[2], 0.0, 0.0, 1.0)
+        is_beat = bool(levels[3]) if len(levels) >= 4 else False
+    else:
+        bass = mids = treble = 0.0
+        is_beat = False
+
+    idx = max(0, int(light_index)) if isinstance(light_index, (int, float)) else 0
+    mode = mode if mode in SYNTH_MODES else "club"
+    colors = SYNTH_PALETTES.get(palette, SYNTH_PALETTES["neon"])
+    band = band if band in SYNTH_BANDS else "all"
+    sens = finite(sensitivity, 1.0, 0.2, 3.0)
+    smooth = finite(smoothness, 0.45, 0.0, 0.95)
+    ph = finite(phase, 0.0, -1e9, 1e9)
+
+    if band == "bass":
+        energy = bass
+    elif band == "mids":
+        energy = mids
+    elif band == "treble":
+        energy = treble
+    else:
+        energy = 0.50 * bass + 0.30 * mids + 0.20 * treble
+    level = clamp(energy * sens, 0.0, 1.0)
+
+    if mode == "club":
+        raw_bri = 18.0 + level * 68.0 + (22.0 if is_beat else 0.0)
+        mid_bri = 55.0
+        pos = ph * 0.75 + idx * 0.85 + (0.65 if is_beat else 0.0) + treble * 0.4
+    elif mode == "chill":
+        raw_bri = 25.0 + level * 52.0 + (8.0 if is_beat else 0.0)
+        mid_bri = 52.0
+        pos = ph * 0.35 + idx * 0.40 + mids * 0.35
+    elif mode == "ambient":
+        raw_bri = 30.0 + level * 42.0 + (4.0 if is_beat else 0.0)
+        mid_bri = 50.0
+        pos = ph * 0.18 + idx * 0.28
+    else:  # strobe
+        raw_bri = (96.0 + level * 4.0) if (is_beat or level > 0.65) else (8.0 + level * 22.0)
+        mid_bri = 50.0
+        pos = ph * 1.4 + idx * 1.1 + (1.5 if is_beat else 0.0)
+
+    bri_f = raw_bri * (1.0 - smooth * 0.35) + mid_bri * (smooth * 0.35)
+    bri = int(round(clamp(bri_f, 1.0, 100.0)))
+
+    n_col = len(colors)
+    wrapped = pos % n_col
+    i0 = int(wrapped) % n_col
+    i1 = (i0 + 1) % n_col
+    frac = wrapped - int(wrapped)
+    hex_color = _lerp_hex(colors[i0], colors[i1], frac)
+    xy = hex_to_xy(hex_color) or [0.3127, 0.329]
+    return {"bri": bri, "xy": xy, "hex": hex_color}
+
+
+def parse_avahi_hue(lines):
+    """Parse `avahi-browse -rtpk _hue._tcp` output into [{ip, bridge_id, name}]."""
+    found = {}
+    for line in lines:
+        parts = line.split(";")
+        if len(parts) < 10 or parts[0] != "=" or parts[2] != "IPv4":
+            continue
+        ip = parts[7]
+        if not valid_bridge_ip(ip):
+            continue
+        bridge_id = ""
+        m = re.search(r'"bridgeid=([0-9a-fA-F]{16})"', ";".join(parts[9:]))
+        if m:
+            bridge_id = m.group(1).upper()
+        name = parts[3].replace("\\032", " ")
+        name = re.sub(r"\\(\d{3})", lambda mm: chr(int(mm.group(1))), name)
+        found[ip] = {"ip": ip, "bridge_id": bridge_id, "name": clean(name)}
+    return sorted(found.values(), key=lambda b: b["ip"])
+
+
+def _json_depth_ok(raw, max_depth=32):
+    text = raw.decode("utf-8", "ignore") if isinstance(raw, (bytes, bytearray)) else str(raw)
+    depth = 0
+    in_str = False
+    esc = False
+    for ch in text:
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch in "{[":
+            depth += 1
+            if depth > max_depth:
+                return False
+        elif ch in "}]":
+            depth -= 1
+    return True
+
+
+def parse_command(line):
+    if not _json_depth_ok(line):
+        return None
+    try:
+        cmd = json.loads(line)
+    except (ValueError, TypeError, RecursionError):
+        return None
+    return cmd if isinstance(cmd, dict) and isinstance(cmd.get("cmd"), str) else None
+
+
+def read_commands(stream):
+    """Commands from a binary stream, one JSON object per line. A line longer than MAX_COMMAND
+    is skipped through its newline without being kept in memory."""
+    while True:
+        line = stream.readline(MAX_COMMAND + 1)
+        if not line:
+            return
+        if len(line) > MAX_COMMAND:
+            while not line.endswith(b"\n"):
+                line = stream.readline(MAX_COMMAND + 1)
+                if not line:
+                    return
+            continue
+        cmd = parse_command(line)
+        if cmd:
+            yield cmd
+
+
+# ---------------------------------------------------------------------------
+# Config
+
+def private_config_dir():
+    """Create the config directory as 0700 and refuse it unless it is our own real directory."""
+    os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
+    info = os.lstat(CONFIG_DIR)
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        raise OSError("config directory is not a private directory owned by this user")
+    if info.st_mode & 0o077:
+        os.chmod(CONFIG_DIR, 0o700)
+    return CONFIG_DIR
+
+
+def load_config():
+    try:
+        fd = os.open(CONFIG_PATH, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)  # a FIFO must not block
+    except OSError:
+        return {}
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_size > MAX_CONFIG:
+            return {}
+        raw = os.read(fd, MAX_CONFIG)
+    except OSError:
+        return {}
+    finally:
+        os.close(fd)
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except ValueError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    if not (valid_bridge_ip(data.get("ip")) and isinstance(data.get("app_key"), str)
+            and re.fullmatch(r"[A-Za-z0-9_-]{1,100}", data["app_key"])
+            and re.fullmatch(r"[0-9a-f]{64}", str(data.get("fingerprint", "")))
+            and BRIDGE_ID_RE.match(str(data.get("bridge_id", "")))):
+        return {}
+    if "name" in data:
+        data["name"] = clean(data.get("name") or "Hue Bridge", 60) or "Hue Bridge"
+    if "model" in data:
+        data["model"] = clean(data.get("model") or "", 40)
+    return data
+
+
+def save_config(data):
+    """Atomic 0600 write via a unique temp file (never a predictable name, never a followed link)."""
+    directory = private_config_dir()
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".config.", suffix=".tmp")
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, CONFIG_PATH)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def remove_config():
+    """Delete the saved pairing. True when no pairing file is left (a missing one counts),
+    False when one is still there (not ours, or the folder is read-only)."""
+    try:
+        info = os.lstat(CONFIG_PATH)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    if not ((stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode)) and info.st_uid == os.getuid()):
+        return False
+    try:
+        os.unlink(CONFIG_PATH)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _rules_path():
+    return os.path.join(CONFIG_DIR, "rules.json")
+
+
+def load_rules():
+    """Load persisted dependency rules from CONFIG_DIR/rules.json (rejecting symlinks, FIFOs, >64 KiB)."""
+    default = {"paused": False, "rules": []}
+    path = _rules_path()
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return default
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_size > MAX_CONFIG:
+            return default
+        raw = os.read(fd, MAX_CONFIG)
+    except OSError:
+        return default
+    finally:
+        os.close(fd)
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        return default
+    if not isinstance(data, dict):
+        return default
+    paused = bool(data.get("paused", False))
+    raw_rules = data.get("rules")
+    if not isinstance(raw_rules, list):
+        return {"paused": paused, "rules": []}
+    rules = []
+    seen = set()
+    for item in raw_rules:
+        if len(rules) >= MAX_RULES:
+            break
+        validated = validate_rule(item)
+        if validated and validated["id"] not in seen:
+            seen.add(validated["id"])
+            rules.append(validated)
+    if detect_rule_cycles(rules):
+        return {"paused": paused, "rules": []}
+    return {"paused": paused, "rules": rules}
+
+
+def save_rules(data):
+    """Atomic 0600 write of rules.json via unique temp file, capped at MAX_CONFIG (64 KiB)."""
+    payload = json.dumps(data, indent=2, allow_nan=False).encode("utf-8")
+    if len(payload) > MAX_CONFIG:
+        raise ValueError("rules file exceeds maximum size")
+    directory = private_config_dir()
+    path = _rules_path()
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".rules.", suffix=".tmp")
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _themes_path():
+    return os.path.join(CONFIG_DIR, "themes.json")
+
+
+def load_themes():
+    """Load persisted custom themes from CONFIG_DIR/themes.json (rejecting symlinks, FIFOs, >64 KiB)."""
+    path = _themes_path()
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return []
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_size > MAX_CONFIG:
+            return []
+        raw = os.read(fd, MAX_CONFIG)
+    except OSError:
+        return []
+    finally:
+        os.close(fd)
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        return []
+    raw_items = data.get("themes") if isinstance(data, dict) else data
+    if not isinstance(raw_items, list):
+        return []
+    themes = []
+    seen = set()
+    for item in raw_items:
+        if len(themes) >= MAX_THEMES:
+            break
+        validated = validate_theme(item)
+        if validated and validated["id"] not in seen:
+            seen.add(validated["id"])
+            themes.append(validated)
+    return themes
+
+
+def save_themes(items):
+    """Atomic 0600 write of themes.json via unique temp file, capped at MAX_CONFIG (64 KiB)."""
+    payload = json.dumps(items, indent=2, allow_nan=False).encode("utf-8")
+    if len(payload) > MAX_CONFIG:
+        raise ValueError("themes file exceeds maximum size")
+    directory = private_config_dir()
+    path = _themes_path()
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".themes.", suffix=".tmp")
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _local_schedules_path():
+    return os.path.join(CONFIG_DIR, "local_schedules.json")
+
+
+def load_local_schedules():
+    """Load persisted schedule mode & local schedules from CONFIG_DIR/local_schedules.json."""
+    default = {"mode": "bridge", "schedules": []}
+    path = _local_schedules_path()
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return default
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_size > MAX_CONFIG:
+            return default
+        raw = os.read(fd, MAX_CONFIG)
+    except OSError:
+        return default
+    finally:
+        os.close(fd)
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        return default
+    if not isinstance(data, dict):
+        return default
+    mode = data.get("mode") if data.get("mode") in SCHEDULE_MODES else "bridge"
+    raw_scheds = data.get("schedules")
+    if not isinstance(raw_scheds, list):
+        return {"mode": mode, "schedules": []}
+    schedules = []
+    seen = set()
+    for item in raw_scheds:
+        if len(schedules) >= MAX_LOCAL_SCHEDULES:
+            break
+        validated = validate_local_schedule(item)
+        if validated and validated["id"] not in seen:
+            seen.add(validated["id"])
+            schedules.append(validated)
+    return {"mode": mode, "schedules": schedules}
+
+
+def save_local_schedules(data):
+    """Atomic 0600 write of local_schedules.json via unique temp file, capped at MAX_CONFIG (64 KiB)."""
+    payload = json.dumps(data, indent=2, allow_nan=False).encode("utf-8")
+    if len(payload) > MAX_CONFIG:
+        raise ValueError("local schedules file exceeds maximum size")
+    directory = private_config_dir()
+    path = _local_schedules_path()
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".local_schedules.", suffix=".tmp")
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _with_local_schedules_lock(fn):
+    """Run `fn()` under an exclusive flock on a verified private `.local_schedules.lock` file."""
+    directory = private_config_dir()
+    lock_path = os.path.join(directory, ".local_schedules.lock")
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            raise OSError("unsafe local schedules lock file")
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return fn()
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(fd)
+
+
+def update_local_schedules(mutator):
+    """Reload local_schedules.json under the exclusive lock, apply `mutator(data)`, and save atomically.
+    Preserves concurrent `last_fired` claims written by other helper instances."""
+    def _run():
+        data = load_local_schedules()
+        changed = mutator(data)
+        if changed is not False:
+            save_local_schedules(data)
+        return data
+    return _with_local_schedules_lock(_run)
+
+
+def claim_local_schedule_bucket(sid, bucket):
+    """Cross-process deduplication for local schedules using an exclusive flock + persisted last_fired.
+    Fails closed (returns False) on lock, symlink, missing-file, or persistence errors so two
+    helper instances can never double-fire the same minute."""
+    def _claim():
+        data = load_local_schedules()
+        for sched in data["schedules"]:
+            if sched["id"] == sid:
+                if sched.get("last_fired") == bucket:
+                    return False
+                sched["last_fired"] = bucket
+                save_local_schedules(data)
+                return True
+        return False
+    try:
+        return bool(_with_local_schedules_lock(_claim))
+    except (OSError, ValueError):
+        return False
+
+
+def _floorplan_path():
+    return os.path.join(CONFIG_DIR, "floorplan.json")
+
+
+def load_floorplan():
+    """Load persisted floorplan from CONFIG_DIR/floorplan.json (rejecting symlinks, FIFOs, >64 KiB)."""
+    path = _floorplan_path()
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_size > MAX_CONFIG:
+            return None
+        raw = os.read(fd, MAX_CONFIG)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        return None
+    return validate_floorplan(data)
+
+
+def save_floorplan(data):
+    """Validate and atomically write floorplan.json as 0600 via unique temp file, capped at MAX_CONFIG."""
+    validated = validate_floorplan(data)
+    if validated is None:
+        raise ValueError("invalid floorplan")
+    payload = json.dumps(validated, indent=2, allow_nan=False).encode("utf-8")
+    if len(payload) > MAX_CONFIG:
+        raise ValueError("floorplan file exceeds maximum size")
+    directory = private_config_dir()
+    path = _floorplan_path()
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".floorplan.", suffix=".tmp")
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return validated
+
+
+def clear_floorplan_background():
+    """Remove any managed `floorplan_bg.*` files strictly inside CONFIG_DIR."""
+    try:
+        dir_info = os.lstat(CONFIG_DIR)
+    except OSError:
+        return
+    if not stat.S_ISDIR(dir_info.st_mode) or dir_info.st_uid != os.getuid():
+        return
+    cfg_real = os.path.realpath(CONFIG_DIR)
+    for entry in MANAGED_FLOORPLAN_BG_NAMES:
+        full = os.path.join(CONFIG_DIR, entry)
+        if os.path.realpath(os.path.dirname(full)) != cfg_real:
+            continue
+        try:
+            info = os.lstat(full)
+        except OSError:
+            continue
+        if (stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode)) and info.st_uid == os.getuid():
+            try:
+                os.unlink(full)
+            except OSError:
+                pass
+
+
+def set_floorplan_background(source_path):
+    """Validate a local image file (PNG/JPEG/WEBP, <= 15 MB, non-symlink, valid magic bytes) and
+    atomically copy it (0600) to CONFIG_DIR/floorplan_bg.<ext>, removing any older background file."""
+    if not isinstance(source_path, str) or not source_path or "\x00" in source_path:
+        raise ValueError("invalid background path")
+    if os.path.islink(source_path):
+        raise ValueError("symlinks are not allowed")
+    _, raw_ext = os.path.splitext(source_path.lower())
+    if raw_ext not in FLOORPLAN_BG_EXTS:
+        raise ValueError("unsupported image extension")
+    fd = os.open(source_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError("background source is not a regular file")
+        if info.st_size <= 0 or info.st_size > MAX_FLOORPLAN_BG_BYTES:
+            raise ValueError("background image exceeds size limit")
+        chunks = []
+        total = 0
+        while total <= MAX_FLOORPLAN_BG_BYTES:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        if total <= 0 or total > MAX_FLOORPLAN_BG_BYTES:
+            raise ValueError("background image exceeds size limit")
+        raw_bytes = b"".join(chunks)
+    finally:
+        os.close(fd)
+
+    detected = _detect_image_ext(raw_bytes)
+    expected = ".jpg" if raw_ext == ".jpeg" else raw_ext
+    if detected is None or detected != expected:
+        raise ValueError("invalid image magic bytes")
+    dims = _image_dimensions(raw_bytes, detected)
+    if dims is None:
+        raise ValueError("unreadable image header")
+    img_w, img_h = dims
+    if (img_w <= 0 or img_h <= 0
+            or img_w > MAX_FLOORPLAN_BG_DIM or img_h > MAX_FLOORPLAN_BG_DIM
+            or img_w * img_h > MAX_FLOORPLAN_BG_PIXELS):
+        raise ValueError("image dimensions exceed limit")
+
+    directory = private_config_dir()
+    target_name = FLOORPLAN_BG_PREFIX + detected.lstrip(".")
+    target_path = os.path.join(directory, target_name)
+    tfd, tmp = tempfile.mkstemp(dir=directory, prefix=".floorplan_bg.", suffix=".tmp")
+    try:
+        os.fchmod(tfd, 0o600)
+        with os.fdopen(tfd, "wb") as fh:
+            fh.write(raw_bytes)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, target_path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+    # Remove only older managed floorplan_bg.{png,jpg,webp} files (never unrelated user files)
+    for entry in MANAGED_FLOORPLAN_BG_NAMES:
+        if entry == target_name:
+            continue
+        old_path = os.path.join(directory, entry)
+        try:
+            old_info = os.lstat(old_path)
+            if (stat.S_ISREG(old_info.st_mode) or stat.S_ISLNK(old_info.st_mode)) and old_info.st_uid == os.getuid():
+                os.unlink(old_path)
+        except OSError:
+            pass
+    return target_path
+
+
+# Children the helper started and has not reaped yet: ended when the helper exits or gets SIGTERM.
+_CHILDREN = set()
+_CHILDREN_LOCK = threading.Lock()
+_SETPRIV = None   # path of util-linux setpriv, "" when it is not installed; looked up once
+
+
+def kill_children():
+    with _CHILDREN_LOCK:
+        children = list(_CHILDREN)
+    for proc in children:
+        try:
+            if proc.poll() is None:
+                proc.kill()
+        except OSError:
+            pass
+
+
+def _parent_death_prefix():
+    """`setpriv --pdeathsig KILL --` so a child ends even when the helper is SIGKILLed. No Python
+    preexec_fn: running Python between fork and exec in this threaded process can deadlock."""
+    global _SETPRIV
+    if _SETPRIV is None:
+        _SETPRIV = shutil.which("setpriv") or ""
+    return [_SETPRIV, "--pdeathsig", "KILL", "--"] if _SETPRIV else []
+
+
+def run_bounded(argv, timeout=6.0, max_bytes=262144):
+    """Run a fixed argv (no shell) and read at most `max_bytes` of stdout before `timeout`."""
+    try:
+        with _CHILDREN_LOCK:
+            proc = subprocess.Popen(_parent_death_prefix() + list(argv), stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            _CHILDREN.add(proc)
+    except OSError:
+        return ""
+    chunks, size = [], 0
+    deadline = time.monotonic() + timeout
+    fd = proc.stdout.fileno()
+    try:
+        while size < max_bytes:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            ready, _, _ = select.select([fd], [], [], remaining)
+            if not ready:
+                break
+            chunk = os.read(fd, min(65536, max_bytes - size))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+    except OSError:
+        pass
+    finally:
+        proc.stdout.close()
+        if proc.poll() is None:
+            proc.kill()
+        try:
+            proc.wait(timeout=0.5)
+        except subprocess.SubprocessError:
+            pass
+        with _CHILDREN_LOCK:
+            _CHILDREN.discard(proc)
+    return b"".join(chunks).decode("utf-8", "replace")
+
+
+# ---------------------------------------------------------------------------
+# HTTPS with certificate pinning
+
+class PinError(Exception):
+    pass
+
+
+class BridgeError(Exception):
+    """The bridge answered with CLIP "errors": a fixed message, never the bridge's own text."""
+
+
+def https_request(ip, method, path, body=None, headers=None, pin=None, timeout=HTTP_TIMEOUT, port=None):
+    """One HTTPS request to the bridge. Returns (status, parsed_json, (fingerprint, cn)).
+
+    With `pin`, the peer certificate must match pin["fingerprint"] and have
+    CN == pin["bridge_id"], otherwise PinError is raised before anything is sent.
+    """
+    port = port or BRIDGE_PORT
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE  # self-signed Philips cert; pinned below instead
+    conn = http.client.HTTPSConnection(ip, port, timeout=timeout, context=ctx)
+    # One overall deadline: a responder that drips headers or body byte by byte is
+    # cut off when the timer shuts the socket down, not just per recv(). The socket is
+    # kept here because a "Connection: close" reply takes it away from conn.sock.
+    expired = threading.Event()
+    connected = []
+    resp = None
+
+    def cut():
+        expired.set()
+        sock = connected[0] if connected else conn.sock
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+    watchdog = threading.Timer(timeout, cut)
+    watchdog.daemon = True
+    watchdog.start()
+    try:
+        conn.connect()
+        connected.append(conn.sock)
+        if expired.is_set():
+            raise OSError("bridge reply timed out")
+        der = conn.sock.getpeercert(binary_form=True) or b""
+        peer = (fingerprint(der), cert_common_name(der).upper())
+        if pin is not None:
+            if peer[0] != pin.get("fingerprint") or (pin.get("bridge_id") and peer[1] != pin["bridge_id"]):
+                raise PinError("bridge certificate changed")
+        data = json.dumps(body).encode() if body is not None else None
+        hdrs = {"Accept": "application/json"}
+        if data is not None:
+            hdrs["Content-Type"] = "application/json"
+        hdrs.update(headers or {})
+        conn.request(method, path, body=data, headers=hdrs)
+        resp = conn.getresponse()
+        length = resp.getheader("Content-Length")
+        if length is not None and (not length.strip().isdigit() or int(length) > MAX_BODY):
+            raise OSError("reply too large")
+        chunks, size = [], 0
+        while size <= MAX_BODY:
+            if expired.is_set():
+                raise OSError("bridge reply timed out")
+            chunk = resp.read1(65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+        if size > MAX_BODY:
+            raise OSError("reply too large")
+        if expired.is_set():
+            raise OSError("bridge reply timed out")
+        raw = b"".join(chunks)
+        try:
+            parsed = json.loads(raw.decode("utf-8")) if raw else None
+        except (ValueError, RecursionError):
+            parsed = None
+        return resp.status, parsed, peer
+    finally:
+        watchdog.cancel()
+        if resp is not None:
+            resp.close()
+        conn.close()
+        for sock in connected:
+            sock.close()
+
+
+def open_sse_stream(ip, app_key, pin, timeout=HTTP_TIMEOUT, read_timeout=SSE_READ_TIMEOUT, port=None):
+    """Open a pinned-TLS GET /eventstream/clip/v2 connection. Returns (conn, resp, sock).
+
+    Enforces a single overall `timeout` deadline across connect, TLS handshake, cert pin check,
+    request write, and response header parsing so a dripping server cannot stall the SSE thread.
+    Raises PinError on certificate mismatch, PermissionError on 401/403, or OSError on failure.
+    """
+    port = port or BRIDGE_PORT
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    conn = http.client.HTTPSConnection(ip, port, timeout=timeout, context=ctx)
+    resp = None
+    sock = None
+    expired = threading.Event()
+    connected = []
+
+    def cut():
+        expired.set()
+        s = connected[0] if connected else conn.sock
+        if s is not None:
+            try:
+                s.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+    watchdog = threading.Timer(timeout, cut)
+    watchdog.daemon = True
+    watchdog.start()
+    try:
+        conn.connect()
+        sock = conn.sock
+        connected.append(sock)
+        if expired.is_set():
+            raise OSError("eventstream handshake timed out")
+        der = sock.getpeercert(binary_form=True) or b""
+        peer = (fingerprint(der), cert_common_name(der).upper())
+        if pin is None or peer[0] != pin.get("fingerprint") or (pin.get("bridge_id") and peer[1] != pin["bridge_id"]):
+            raise PinError("bridge certificate changed")
+        conn.request("GET", "/eventstream/clip/v2", headers={
+            "Accept": "text/event-stream",
+            "hue-application-key": app_key,
+        })
+        resp = conn.getresponse()
+        if expired.is_set():
+            raise OSError("eventstream handshake timed out")
+        if resp.status in (401, 403):
+            raise PermissionError("bridge rejected the app key")
+        if resp.status != 200:
+            raise OSError("eventstream returned HTTP %d" % resp.status)
+        watchdog.cancel()
+        if sock is not None:
+            sock.settimeout(read_timeout)
+        return conn, resp, sock
+    except BaseException:
+        watchdog.cancel()
+        if resp is not None:
+            try:
+                resp.close()
+            except OSError:
+                pass
+        try:
+            conn.close()
+        except OSError:
+            pass
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+        raise
+
+
+SSE_LINE_TIMEOUT = 15.0
+
+
+def iter_bounded_lines(read_chunk, max_line=MAX_BODY, line_timeout=None):
+    """Yield complete lines (bytes) from `read_chunk()`, dropping any line longer than `max_line`.
+    If `read_chunk()` returns None (e.g. idle poll timeout), no EOF is assumed; if `line_timeout`
+    is set and a partial line remains unfinished beyond `line_timeout` seconds, raises OSError."""
+    buf = bytearray()
+    dropping = False
+    line_started = None
+    while True:
+        chunk = read_chunk()
+        if chunk is None:
+            if line_timeout is not None and line_started is not None:
+                if time.monotonic() - line_started > line_timeout:
+                    raise OSError("eventstream line timed out")
+            continue
+        if not chunk:
+            if not dropping and buf:
+                yield bytes(buf)
+            return
+        now_m = time.monotonic()
+        if line_timeout is not None and line_started is not None and (now_m - line_started > line_timeout):
+            raise OSError("eventstream line timed out")
+        start = 0
+        while start < len(chunk):
+            nl = chunk.find(b"\n", start)
+            if nl == -1:
+                seg = chunk[start:]
+                if line_started is None and seg:
+                    line_started = now_m
+                if not dropping:
+                    if len(buf) + len(seg) > max_line:
+                        buf.clear()
+                        dropping = True
+                    else:
+                        buf.extend(seg)
+                break
+            seg = chunk[start:nl + 1]
+            start = nl + 1
+            line_started = None
+            if dropping:
+                dropping = False
+                continue
+            if len(buf) + len(seg) > max_line:
+                buf.clear()
+                continue
+            buf.extend(seg)
+            yield bytes(buf)
+            buf.clear()
+
+
+# ---------------------------------------------------------------------------
+# Audio-reactive light synthesizer
+
+class SynthController:
+    """Streams audio-reactive (parec or Demo Beat) updates to Hue lights in a background thread."""
+
+    def __init__(self, hue_obj):
+        self.hue = hue_obj
+        self.running = False
+        self.source = "system"
+        self.mode = "club"
+        self.palette = "neon"
+        self.room_id = ""
+        self.sensitivity = 1.0
+        self.smoothness = 0.45
+        self.light_bands = {}
+        self.bass = 0.0
+        self.mids = 0.0
+        self.treble = 0.0
+        self.beat = False
+        self.error = ""
+        self._stop_ev = None
+        self._thread = None
+        self._proc = None
+        self._proc_lock = threading.Lock()
+
+    def snapshot(self):
+        """Return JSON-safe synth state dict (call under hue.lock)."""
+        return {
+            "running": bool(self.running),
+            "source": self.source,
+            "mode": self.mode,
+            "palette": self.palette,
+            "room_id": self.room_id,
+            "sensitivity": round(self.sensitivity, 2),
+            "smoothness": round(self.smoothness, 2),
+            "light_bands": dict(self.light_bands),
+            "bass": round(self.bass, 3),
+            "mids": round(self.mids, 3),
+            "treble": round(self.treble, 3),
+            "beat": bool(self.beat),
+            "error": self.error,
+        }
+
+    def configure(self, cmd):
+        """Validate and update synth settings from a `synth_config` command (call under hue.lock)."""
+        if not isinstance(cmd, dict):
+            return False
+        changed = False
+        if "source" in cmd and cmd["source"] in SYNTH_SOURCES:
+            new_source = cmd["source"]
+            if new_source != self.source:
+                self.source = new_source
+                self.error = ""
+                changed = True
+        if "mode" in cmd and cmd["mode"] in SYNTH_MODES:
+            self.mode = cmd["mode"]
+            changed = True
+        if "palette" in cmd and cmd["palette"] in SYNTH_PALETTES:
+            self.palette = cmd["palette"]
+            changed = True
+        if "room_id" in cmd:
+            rid = cmd["room_id"]
+            if rid == "" or rid is None:
+                self.room_id = ""
+                changed = True
+            elif valid_uuid(rid):
+                self.room_id = rid
+                changed = True
+        if "sensitivity" in cmd and not isinstance(cmd["sensitivity"], bool):
+            s = finite(cmd["sensitivity"], None, 0.2, 3.0)
+            if s is not None:
+                self.sensitivity = round(s, 2)
+                changed = True
+        if "smoothness" in cmd and not isinstance(cmd["smoothness"], bool):
+            sm = finite(cmd["smoothness"], None, 0.0, 0.95)
+            if sm is not None:
+                self.smoothness = round(sm, 2)
+                changed = True
+        if isinstance(cmd.get("light_bands"), dict):
+            cleaned = {}
+            for lid, bnd in cmd["light_bands"].items():
+                if len(cleaned) >= MAX_GROUP_LIGHTS:
+                    break
+                if valid_uuid(lid) and bnd in SYNTH_BANDS:
+                    cleaned[lid] = bnd
+            self.light_bands = cleaned
+            changed = True
+        if valid_uuid(cmd.get("light_id")) and cmd.get("band") in SYNTH_BANDS:
+            if cmd["light_id"] in self.light_bands or len(self.light_bands) < MAX_GROUP_LIGHTS:
+                self.light_bands[cmd["light_id"]] = cmd["band"]
+                changed = True
+        return changed
+
+    def start(self):
+        with self.hue.lock:
+            if not self.hue.config:
+                return False
+            if self.running and self._thread is not None and self._thread.is_alive():
+                return False
+            self.running = True
+            self.error = ""
+            self.bass = self.mids = self.treble = 0.0
+            self.beat = False
+            stop_ev = threading.Event()
+            self._stop_ev = stop_ev
+            thread = threading.Thread(target=self._run, args=(stop_ev,), daemon=True)
+            self._thread = thread
+            thread.start()
+        self.hue.emit()
+        return True
+
+    def stop(self, emit=True):
+        with self.hue.lock:
+            was_active = self.running or self._thread is not None or self._proc is not None
+            self.running = False
+            self.bass = self.mids = self.treble = 0.0
+            self.beat = False
+            stop_ev = self._stop_ev
+            self._stop_ev = None
+            thread = self._thread
+            self._thread = None
+        with self._proc_lock:
+            if stop_ev is not None:
+                stop_ev.set()
+            proc = self._proc
+            self._proc = None
+        if proc is not None:
+            self._terminate_proc(proc)
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=1.5)
+        if emit and was_active:
+            self.hue.emit()
+        return was_active
+
+    def _terminate_proc(self, proc):
+        try:
+            if proc.stdout is not None:
+                proc.stdout.close()
+        except OSError:
+            pass
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=0.3)
+                except subprocess.SubprocessError:
+                    proc.kill()
+                    try:
+                        proc.wait(timeout=0.3)
+                    except subprocess.SubprocessError:
+                        pass
+        except OSError:
+            pass
+        with _CHILDREN_LOCK:
+            _CHILDREN.discard(proc)
+
+    def _target_lights(self):
+        """Return target light dicts for current room_id (call under hue.lock)."""
+        rid = self.room_id
+        if rid:
+            for room in self.hue.rooms:
+                if room["id"] == rid:
+                    return list(room["lights"])
+            return []
+        seen = set()
+        lights = []
+        for room in self.hue.rooms:
+            if room["kind"] == "zone":
+                continue
+            for light in room["lights"]:
+                if light["id"] not in seen:
+                    seen.add(light["id"])
+                    lights.append(light)
+        return lights
+
+    def _apply_step(self, bass, mids, treble, is_beat, now_mono, phase, last_light_push, last_emit):
+        with self.hue.lock:
+            self.bass = bass
+            self.mids = mids
+            self.treble = treble
+            self.beat = is_beat
+            panel_open = self.hue.panel_open
+            should_push = (now_mono - last_light_push) >= SYNTH_LIGHT_INTERVAL
+            pushed = False
+            if should_push and self.hue.config:
+                lights = self._target_lights()
+                mode = self.mode
+                palette = self.palette
+                sensitivity = self.sensitivity
+                smoothness = self.smoothness
+                light_bands = dict(self.light_bands)
+                for idx, light in enumerate(lights):
+                    lid = light["id"]
+                    band = light_bands.get(lid, "all")
+                    frame = map_synth_frame(
+                        idx, (bass, mids, treble, is_beat),
+                        mode, palette, band, sensitivity, smoothness, phase,
+                    )
+                    body = {
+                        "on": {"on": True},
+                        "dimming": {"brightness": float(frame["bri"])},
+                        "dynamics": {"duration": 200},
+                    }
+                    if light.get("supports_color"):
+                        body["color"] = {"xy": {"x": frame["xy"][0], "y": frame["xy"][1]}}
+                    if self.hue.queue("light", lid, body, from_rule=True):
+                        self.hue._suppress_target("light", lid, now_mono + RULE_ECHO_WINDOW, expected_on=True)
+                        pushed = True
+                last_light_push = now_mono
+        if pushed:
+            self.hue.wake.set()
+        emit_interval = SYNTH_EMIT_OPEN if panel_open else SYNTH_EMIT_CLOSED
+        if now_mono - last_emit >= emit_interval:
+            self.hue.emit()
+            last_emit = now_mono
+        return last_light_push, last_emit
+
+    def _run(self, stop_ev):
+        tracker = AudioBeatTracker()
+        start_t = time.monotonic()
+        last_light_push = 0.0
+        last_emit = 0.0
+        phase = 0.0
+        try:
+            while not stop_ev.is_set() and not self.hue._stop.is_set():
+                with self.hue.lock:
+                    if not self.running or not self.hue.config:
+                        break
+                    source = self.source
+                    sensitivity = self.sensitivity
+                    smoothness = self.smoothness
+                if source == "demo":
+                    now_mono = time.monotonic()
+                    bass, mids, treble, is_beat = demo_beat_levels(now_mono - start_t)
+                    phase += 0.14 + (0.25 if is_beat else 0.0)
+                    last_light_push, last_emit = self._apply_step(
+                        bass, mids, treble, is_beat, now_mono, phase, last_light_push, last_emit
+                    )
+                    stop_ev.wait(0.05)
+                    continue
+
+                # System or microphone capture via PulseAudio/PipeWire `parec`
+                parec = shutil.which("parec")
+                if not parec:
+                    with self.hue.lock:
+                        self.error = "parec not available"
+                        self.running = False
+                        self.bass = self.mids = self.treble = 0.0
+                        self.beat = False
+                    self.hue.emit()
+                    return
+                device = "@DEFAULT_MONITOR@" if source == "system" else "@DEFAULT_SOURCE@"
+                argv = _parent_death_prefix() + [
+                    parec, "--raw", "--format=s16le", "--channels=1", "--rate=16000",
+                    "--device=" + device,
+                ]
+                proc = None
+                try:
+                    with self._proc_lock:
+                        if stop_ev.is_set() or self.hue._stop.is_set():
+                            return
+                        with _CHILDREN_LOCK:
+                            proc = subprocess.Popen(
+                                argv, shell=False, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                            )
+                            _CHILDREN.add(proc)
+                        self._proc = proc
+                    with self.hue.lock:
+                        if stop_ev.is_set() or not self.running:
+                            break
+                    tracker.reset()
+                    fd = proc.stdout.fileno()
+                    pcm_buf = bytearray()
+                    chunk_bytes = 1024  # 512 s16le samples = 32ms @ 16kHz
+                    while not stop_ev.is_set() and not self.hue._stop.is_set():
+                        with self.hue.lock:
+                            if not self.running or not self.hue.config or self.source != source:
+                                break
+                            sensitivity = self.sensitivity
+                            smoothness = self.smoothness
+                        try:
+                            ready, _, _ = select.select([fd], [], [], 0.1)
+                        except (OSError, ValueError):
+                            break
+                        if not ready:
+                            continue
+                        try:
+                            chunk = os.read(fd, 4096)
+                        except OSError:
+                            chunk = b""
+                        if not chunk:
+                            if not stop_ev.is_set():
+                                with self.hue.lock:
+                                    if self.running and self.source == source:
+                                        self.error = "audio capture exited"
+                                        self.running = False
+                                        self.bass = self.mids = self.treble = 0.0
+                                        self.beat = False
+                                self.hue.emit()
+                            return
+                        pcm_buf.extend(chunk)
+                        if len(pcm_buf) < chunk_bytes:
+                            continue
+                        frame_bytes = bytes(pcm_buf[-chunk_bytes:])
+                        pcm_buf.clear()
+                        raw_b, raw_m, raw_t = analyze_pcm_bands(frame_bytes, sample_rate=16000)
+                        now_mono = time.monotonic()
+                        bass, mids, treble, is_beat = tracker.update(
+                            raw_b, raw_m, raw_t,
+                            sensitivity=sensitivity, smoothness=smoothness, now_mono=now_mono,
+                        )
+                        phase += 0.10 + (0.25 if is_beat else 0.0)
+                        last_light_push, last_emit = self._apply_step(
+                            bass, mids, treble, is_beat, now_mono, phase, last_light_push, last_emit
+                        )
+                except OSError as exc:
+                    if not stop_ev.is_set():
+                        with self.hue.lock:
+                            self.error = clean(str(exc), 80) or "audio capture failed"
+                            self.running = False
+                            self.bass = self.mids = self.treble = 0.0
+                            self.beat = False
+                        self.hue.emit()
+                    return
+                finally:
+                    if proc is not None:
+                        with self.hue.lock:
+                            if self._proc is proc:
+                                self._proc = None
+                        self._terminate_proc(proc)
+        finally:
+            with self.hue.lock:
+                if self._thread is threading.current_thread():
+                    self._thread = None
+                if self._stop_ev is stop_ev:
+                    self._stop_ev = None
+                    self.running = False
+
+
+_AI_MOD_LOCK = threading.Lock()
+_AI_MOD = None
+_PROVIDERS_MOD_LOCK = threading.Lock()
+_PROVIDERS_MOD = None
+
+
+def _load_ai_module():
+    """Lazily load sibling scripts/hue-ai.py (works even under `python3 -I`)."""
+    global _AI_MOD
+    if _AI_MOD is not None:
+        return _AI_MOD
+    with _AI_MOD_LOCK:
+        if _AI_MOD is not None:
+            return _AI_MOD
+        ai_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hue-ai.py")
+        spec = importlib.util.spec_from_file_location("hue_ai", ai_path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError("Could not load hue-ai.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _AI_MOD = mod
+        return mod
+
+
+def _load_providers_module():
+    global _PROVIDERS_MOD
+    with _PROVIDERS_MOD_LOCK:
+        if _PROVIDERS_MOD is not None:
+            return _PROVIDERS_MOD
+        prov_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hue_providers.py")
+        if not os.path.isfile(prov_path):
+            return None
+        spec = importlib.util.spec_from_file_location("hue_providers", prov_path)
+        if spec is None or spec.loader is None:
+            return None
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _PROVIDERS_MOD = mod
+        return _PROVIDERS_MOD
+
+
+def valid_resource_id(value):
+    if valid_uuid(value):
+        return True
+    mod = _load_providers_module()
+    return bool(mod and mod.valid_resource_id(value))
+
+
+def is_extra_resource(value):
+    if valid_uuid(value):
+        return False
+    mod = _load_providers_module()
+    return bool(mod and mod.is_extra_resource(value))
+
+
+# ---------------------------------------------------------------------------
+# Main state machine
+
+class Hue:
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.wake = threading.Event()
+        self.sse_wake = threading.Event()
+        self._stop = threading.Event()
+        self._sse_sock = None
+        self.config = load_config()
+        self.panel_open = False
+        self.rooms = []
+        self.light_count = 0
+        self.on_count = 0
+        self.bridge_home_gl = ""
+        self.bridge_model_id = ""
+        self.sensors = []
+        self._sensor_service_owners = {}
+        self.motion_areas = []
+        self.motion_area_candidates = 0
+        self.motion_area_candidate_rooms = []
+        self.entertainment_areas = []
+        self._light_to_ent_service = {}
+        # C1: Load providers module BEFORE load_floorplan/load_local_schedules/load_rules so multi-provider IDs validate
+        self._providers_mod = _load_providers_module()
+        self.floorplan = load_floorplan()
+        self.custom_themes = load_themes()
+        local_sched_data = load_local_schedules()
+        self.schedule_mode = local_sched_data["mode"]
+        self.bridge_schedules = []
+        self.local_schedules = local_sched_data["schedules"]
+        self.schedules = list(self.local_schedules)
+        self._local_sched_fired = {}  # schedule_id -> "YYYY-MM-DD HH:MM"
+        self.schedule_script_id = DEFAULT_SCHEDULE_SCRIPT_ID
+        rules_data = load_rules()
+        self.rules = rules_data["rules"]
+        self.rules_paused = rules_data["paused"]
+        self.rule_log = []
+        self.echo_suppress = {}       # (kind, rid) -> (expires_monotonic, expected_on)
+        self.rule_last_fired = {}     # rule_id -> last_fired_monotonic
+        self.api_queue = []           # [(method, path, body[, meta]), ...]
+        self._sync_batch_seq = 0
+        self._batch_rollbacks = {}    # batch_id -> [(method, path, body), ...]
+        self.synth = SynthController(self)
+        self.ai_state = {
+            "busy": False,
+            "last_prompt": "",
+            "last_reply": "",
+            "last_actions": [],
+            "engine": "",
+            "error": "",
+        }
+        self._ai_seq = 0
+        self.phase = "connecting" if self.config else "unpaired"
+        self.error = ""
+        # error_code/error_args let the panel show the message in its language.
+        self.error_code = ""
+        self.error_args = []
+        self.candidates = []
+        self.discovering = False
+        self.pair_ip = ""
+        self.pair_until = 0.0
+        self.pair_generation = 0   # bumped by pair, cancel_pair and unpair
+        # Bumped by pair, a saved pairing and unpair: a refresh, relocation or command that
+        # started under an older connection drops its result.
+        self.conn_generation = 0
+        # Keys this process has held (application key, client key): never part of an error text.
+        # Only well-formed keys from a pairing that is still current, at most MAX_SECRETS.
+        self.secrets = {self.config["app_key"]} if self.config.get("app_key") else set()
+        self.pending = {}          # (kind, id) -> body, coalesced
+        self.last_sent = {"light": 0.0, "grouped_light": 0.0, "scene": 0.0}
+        self.last_refresh = 0.0
+        self.refresh_hold_until = 0.0
+        self.providers_mgr = self._providers_mod.ProviderManager(CONFIG_DIR) if self._providers_mod else None
+        self._last_extra_refresh = 0.0
+        if self.providers_mgr and getattr(self.providers_mgr, "load_warning", ""):
+            self.error = self.providers_mgr.load_warning
+        if not self.config and self.providers_mgr and self.providers_mgr.has_enabled():
+            self.phase = "connecting"
+
+    def _reset_sse(self):
+        """Close any active SSE socket and wake the SSE listener thread."""
+        sock = None
+        with self.lock:
+            sock = getattr(self, "_sse_sock", None)
+            self._sse_sock = None
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                sock.close()
+            except OSError:
+                pass
+        sse_wake = getattr(self, "sse_wake", None)
+        if sse_wake is not None:
+            sse_wake.set()
+
+    def remember_secrets(self, *keys):
+        """Under self.lock: keep `keys` for redaction. The set stays small: when full, only the
+        current application key survives."""
+        keys = [k for k in keys if k]
+        if len(self.secrets) + len(keys) > MAX_SECRETS:
+            current = self.config.get("app_key")
+            self.secrets = {current} if current else set()
+        self.secrets.update(keys)
+
+    def redact(self, text):
+        text = str(text)
+        extra_secrets = self.providers_mgr.secrets() if getattr(self, "providers_mgr", None) else set()
+        for secret in self.secrets | extra_secrets | {self.config.get("app_key") or ""}:
+            if len(secret) >= 6:
+                text = text.replace(secret, "***")
+        return text
+
+    def _has_extra_providers(self):
+        mgr = getattr(self, "providers_mgr", None)
+        return bool(mgr and mgr.has_enabled())
+
+    def _all_rooms(self):
+        rooms = list(self.rooms)
+        mgr = getattr(self, "providers_mgr", None)
+        if mgr:
+            extra_rooms, _, _, _, _ = mgr.snapshot_parts()
+            rooms.extend(extra_rooms)
+        return rooms
+
+    def _apply_extra_optimistic(self, rid, body):
+        mgr = getattr(self, "providers_mgr", None)
+        if not mgr:
+            return
+        on = body.get("on", {}).get("on") if "on" in body else None
+        bri = body.get("dimming", {}).get("brightness") if "dimming" in body else None
+        mirek = body.get("color_temperature", {}).get("mirek") if "color_temperature" in body else None
+        xy = body.get("color", {}).get("xy") if "color" in body else None
+        effect = body.get("effects", {}).get("effect") if "effects" in body else None
+        with mgr.lock:
+            for res in mgr.results.values():
+                changed = False
+                for room in res.get("rooms", []):
+                    for light in room.get("lights", []):
+                        if light.get("id") == rid:
+                            changed = True
+                            if on is not None:
+                                light["on"] = on
+                            if bri is not None:
+                                light["bri"], light["on"] = bri, True
+                            if mirek is not None:
+                                light["mirek"] = mirek
+                                light["color"] = mirek_to_hex(mirek)
+                                light["on"] = True
+                            if xy is not None:
+                                light["color"] = xy_to_hex(xy.get("x"), xy.get("y"))
+                                light["mirek"] = None
+                                light["on"] = True
+                            if effect is not None:
+                                light["effect"] = effect
+                                if effect != "no_effect":
+                                    light["on"] = True
+                    if changed:
+                        lit = [l for l in room.get("lights", []) if l.get("on")]
+                        room["on"], room["on_count"] = bool(lit), len(lit)
+                        room["color"] = blend_colors([l["color"] for l in lit])
+                        if lit:
+                            room["bri"] = round(sum(l["bri"] for l in lit) / len(lit), 1)
+                if changed:
+                    res["on_count"] = sum(1 for r in res.get("rooms", []) for l in r.get("lights", []) if l.get("on"))
+
+    def refresh_extra_providers(self):
+        mgr = getattr(self, "providers_mgr", None)
+        if not mgr or not mgr.has_enabled():
+            return
+        mgr.refresh_all()
+        self._last_extra_refresh = time.time()
+
+    def safe(self, exc, limit):
+        """An exception's text for the panel: keys removed first, then cleaned and cut."""
+        return clean(self.redact(exc), limit)
+
+    def set_error(self, code, text, *args):
+        """English message for logs and old panels, plus a code and arguments the panel translates.
+        Keys are removed from every part as a backstop."""
+        args = [self.redact(a) for a in args]
+        self.error = self.redact(text % tuple(args) if args else text)
+        self.error_code = code
+        self.error_args = args
+
+    def _ensure_floorplan(self):
+        """Return current floorplan or auto-bootstrap from 'auto_bridge' (call with lock held)."""
+        if self.floorplan is None:
+            bid = self.config.get("bridge_id", "") if self.config else ""
+            self.floorplan = build_floorplan_template("auto_bridge", self.rooms, bridge_id=bid)
+        return self.floorplan
+
+    # -- output
+    def snapshot(self):
+        with self.lock:
+            bridge = {}
+            motion_areas = getattr(self, "motion_areas", [])
+            sensors = getattr(self, "sensors", [])
+            if self.config:
+                model_id = getattr(self, "bridge_model_id", "") or self.config.get("model", "")
+                is_pro = (model_id == "BSB003") or (len(motion_areas) > 0)
+                bridge = {
+                    "ip": self.config.get("ip", ""),
+                    "name": self.config.get("name", "Hue Bridge"),
+                    "model": self.config.get("model", ""),
+                    "model_id": model_id,
+                    "is_pro": is_pro,
+                    "motion_area_candidates": int(getattr(self, "motion_area_candidates", 0)),
+                    "motion_area_candidate_rooms": list(getattr(self, "motion_area_candidate_rooms", [])),
+                }
+            mgr = getattr(self, "providers_mgr", None)
+            extra_rooms, extra_sensors, extra_lights, extra_on, providers_list = (
+                mgr.snapshot_parts() if mgr else ([], [], 0, 0, [])
+            )
+            all_rooms = list(self.rooms) + list(extra_rooms)
+            all_sensors = list(sensors) + list(extra_sensors)
+            total_lights = int(self.light_count) + int(extra_lights)
+            total_on = int(self.on_count) + int(extra_on)
+            phase = self.phase
+            error_text = self.error
+            if not self.config and not self.pair_ip and mgr and mgr.has_enabled():
+                enabled_p = [p for p in providers_list if p.get("enabled")]
+                any_loaded = any(p.get("connected") or p.get("light_count", 0) > 0 for p in enabled_p)
+                all_errored = bool(enabled_p) and all(bool(p.get("error")) for p in enabled_p)
+                if any_loaded:
+                    phase = "ok"
+                elif all_errored:
+                    phase = "error"
+                    if not error_text:
+                        error_text = enabled_p[0].get("error", "")
+                else:
+                    phase = "connecting"
+                badges = sorted({(self._providers_mod.PROVIDER_KINDS.get(p["kind"], {}).get("badge") or p["kind"]) for p in enabled_p}) if getattr(self, "_providers_mod", None) else []
+                bridge = {
+                    "ip": enabled_p[0]["host"] if len(enabled_p) == 1 else ", ".join(badges),
+                    "name": enabled_p[0]["name"] if len(enabled_p) == 1 else f"{len(enabled_p)} Devices",
+                    "model": ", ".join(badges),
+                    "model_id": "",
+                    "is_pro": False,
+                    "motion_area_candidates": 0,
+                    "motion_area_candidate_rooms": [],
+                }
+            fp = getattr(self, "floorplan", None)
+            if fp is None and all_rooms:
+                fp = build_floorplan_template("auto_bridge", all_rooms, bridge_id=self.config.get("bridge_id", "") if self.config else "")
+                self.floorplan = fp
+            return {
+                "phase": phase, "error": error_text, "bridge": bridge, "hue_paired": bool(self.config),
+                "error_code": self.error_code if self.error else "", "error_args": self.error_args if self.error else [],
+                "rooms": all_rooms, "light_count": total_lights, "on_count": total_on,
+                "candidates": self.candidates, "discovering": self.discovering,
+                "pair_ip": self.pair_ip,
+                "pair_remaining": max(0, int(self.pair_until - time.time())) if self.pair_ip else 0,
+                "schedules": getattr(self, "schedules", []),
+                "schedule_mode": getattr(self, "schedule_mode", "bridge"),
+                "themes": [dict(t) for t in BUILTIN_THEMES] + list(getattr(self, "custom_themes", [])),
+                "synth": self.synth.snapshot() if hasattr(self, "synth") else {
+                    "running": False, "source": "system", "mode": "club", "palette": "neon",
+                    "room_id": "", "sensitivity": 1.0, "smoothness": 0.45, "light_bands": {},
+                    "bass": 0.0, "mids": 0.0, "treble": 0.0, "beat": False, "error": "",
+                },
+                "rules": getattr(self, "rules", []),
+                "rules_paused": getattr(self, "rules_paused", False),
+                "rule_log": getattr(self, "rule_log", []),
+                "entertainment_areas": getattr(self, "entertainment_areas", []),
+                "motion_areas": motion_areas,
+                "sensors": all_sensors,
+                "providers": providers_list,
+                "discovered_providers": list(mgr.discovered) if mgr else [],
+                "discovering_providers": bool(mgr.discovering) if mgr else False,
+                "provider_action": dict(mgr.last_action) if mgr else {"running": False, "kind": "", "ok": False, "message": "", "pair_id": ""},
+                "floorplan": fp,
+                "ai": (lambda st: {
+                    "busy": bool(st.get("busy", False)),
+                    "last_prompt": str(st.get("last_prompt", "")),
+                    "last_reply": str(st.get("last_reply", "")),
+                    "last_actions": list(st.get("last_actions") or []),
+                    "engine": str(st.get("engine", "")),
+                    "error": str(st.get("error", "")),
+                })(getattr(self, "ai_state", {})),
+            }
+
+    def emit(self):
+        # Taken, serialised and written under one lock, so snapshots leave in the order they were
+        # taken (an older one can never overwrite the panel's view after Unpair).
+        with self.lock:
+            snap = self.snapshot()
+            try:
+                line = json.dumps(snap, separators=(",", ":"), allow_nan=False)
+            except ValueError:   # backstop: a non-finite number the parsers missed
+                self.rooms, self.light_count, self.on_count, self.phase = [], 0, 0, "error"
+                self.set_error("errReply", "The bridge sent a reply this app does not understand.")
+                line = json.dumps(self.snapshot(), separators=(",", ":"), allow_nan=False)
+            sys.stdout.write(line + "\n")
+            sys.stdout.flush()
+
+    # -- bridge access
+    def connection(self):
+        """(config snapshot, generation) for network work outside the lock; no config while a
+        pairing runs, so nothing started then can change what the pairing shows."""
+        with self.lock:
+            return (dict(self.config) if not self.pair_ip else {}), self.conn_generation
+
+    def connection_current(self, generation):
+        """Still the connection the work started under, and no pairing running (lock held)."""
+        return bool(self.config) and not self.pair_ip and self.conn_generation == generation
+
+    def known(self, kind, rid):
+        """A light, grouped light or scene of the current model (call with the lock held)."""
+        if kind == "grouped_light" and rid and rid == getattr(self, "bridge_home_gl", ""):
+            return True
+        for room in self._all_rooms():
+            if kind == "grouped_light" and room["grouped_light"] == rid:
+                return True
+            if kind == "light" and any(light["id"] == rid for light in room["lights"]):
+                return True
+            if kind == "scene" and any(scene["id"] == rid for scene in room["scenes"]):
+                return True
+        return False
+
+    def known_target(self, target_kind, target_id):
+        """A light, room or zone ID of the current model (call with the lock held)."""
+        if not valid_resource_id(target_id):
+            return False
+        if target_kind == "light":
+            return self.known("light", target_id)
+        if target_kind in ("room", "zone"):
+            return any(r["kind"] == target_kind and r["id"] == target_id for r in self._all_rooms())
+        return False
+
+    def may_queue(self, kind, rid):
+        """Only resources the panel can show, and at most MAX_PENDING queued (lock held)."""
+        return self.known(kind, rid) and ((kind, rid) in self.pending or len(self.pending) < MAX_PENDING)
+
+    def api(self, method, path, body=None, config=None):
+        config = config if config is not None else self.connection()[0]
+        pin = {"fingerprint": config.get("fingerprint"), "bridge_id": config.get("bridge_id", "")}
+        status, data, _ = https_request(config["ip"], method, path, body,
+                                        {"hue-application-key": config["app_key"]}, pin=pin)
+        if status in (401, 403):
+            raise PermissionError("bridge rejected the app key")
+        if status >= 400:
+            raise OSError("bridge returned HTTP %d" % status)
+        errors = data.get("errors") if isinstance(data, dict) else None
+        if isinstance(errors, list) and errors:
+            raise BridgeError("bridge reported an error")
+        return data
+
+    def refresh(self):
+        config, generation = self.connection()
+        if not config:
+            return
+        failure = None
+        try:
+            data = self.api("GET", "/clip/v2/resource", config=config)
+            if not isinstance(data, dict) or not isinstance(data.get("data"), list):
+                raise ValueError("unexpected reply")
+            rooms, total, on = build_model(data["data"])
+            bridge_home_gl = extract_bridge_home_gl(data["data"])
+            bridge_model_id = extract_bridge_model_id(data["data"])
+            motion_areas = parse_motion_areas(data["data"], rooms)
+            motion_area_candidates, motion_area_candidate_rooms = parse_motion_area_candidates(data["data"], rooms)
+            annotate_motion_aware_lights(rooms, motion_areas)
+            sensors = parse_sensors(data["data"])
+            sensor_svc_owners = _extract_sensor_service_owners(data["data"])
+            schedules, script_id = parse_schedules(data["data"], rooms)
+            entertainment_areas = parse_entertainment_areas(data["data"])
+            light_to_ent = _extract_light_entertainment_services(data["data"])
+            with self.lock:
+                if self.connection_current(generation):
+                    if time.time() >= self.refresh_hold_until:
+                        self.rooms, self.light_count, self.on_count = rooms, total, on
+                    else:
+                        annotate_motion_aware_lights(self.rooms, motion_areas)
+                    self.bridge_home_gl = bridge_home_gl
+                    self.bridge_model_id = bridge_model_id
+                    self.motion_areas = motion_areas
+                    self.motion_area_candidates = motion_area_candidates
+                    self.motion_area_candidate_rooms = motion_area_candidate_rooms
+                    self.sensors = sensors
+                    self._sensor_service_owners = sensor_svc_owners
+                    self.entertainment_areas = entertainment_areas
+                    self._light_to_ent_service = light_to_ent
+                    if self.floorplan is None and self.rooms:
+                        self.floorplan = build_floorplan_template(
+                            "auto_bridge", self.rooms, bridge_id=config.get("bridge_id", "")
+                        )
+                    self.bridge_schedules = schedules
+                    self._rebuild_schedules()
+                    if script_id:
+                        self.schedule_script_id = script_id
+                    self.phase, self.error = "ok", ""
+        except (ValueError, TypeError, KeyError, AttributeError, BridgeError):
+            failure = ("errReply", "The bridge sent a reply this app does not understand.")
+        except PinError:
+            failure = ("errCert", "The bridge certificate changed. Unpair and pair again if you replaced the bridge.")
+        except PermissionError:
+            failure = ("errRejected", "The bridge no longer accepts this app. Unpair and pair again.")
+        except (OSError, socket.timeout, http.client.HTTPException) as exc:
+            failure = ("errUnreachable", "Bridge not reachable (%s)", self.safe(exc, 80))
+        if failure:
+            with self.lock:
+                current = self.connection_current(generation)
+                if current:
+                    self.phase = "error"
+                    self.set_error(*failure)
+            if current and failure[0] == "errUnreachable":
+                self.relocate(config, generation)
+        self.last_refresh = time.time()
+
+    def relocate(self, config, generation):
+        """The bridge got a new DHCP address: find it again by bridge id via mDNS. The new address
+        is saved only if Unpair or another Pair did not replace the connection meanwhile."""
+        bridge_id = config.get("bridge_id")
+        if not bridge_id:
+            return
+        for cand in self.discover_now():
+            if cand["bridge_id"] == bridge_id and cand["ip"] != config.get("ip"):
+                with self.lock:
+                    if not self.connection_current(generation):
+                        return
+                    moved = dict(self.config, ip=cand["ip"])
+                    save_config(moved)
+                    self.config = moved
+                    self.conn_generation += 1
+                self._reset_sse()
+                self.wake.set()
+                return
+
+    def discover_now(self):
+        return parse_avahi_hue(run_bounded(["avahi-browse", "-rtpk", "_hue._tcp"]).splitlines())
+
+    def claim_discovery(self):
+        """One discovery at a time: True when this caller got the slot."""
+        with self.lock:
+            if self.discovering:
+                return False
+            self.discovering = True
+            return True
+
+    def start_discovery(self):
+        if self.claim_discovery():
+            threading.Thread(target=self.run_discovery, daemon=True).start()
+
+    def discover(self):
+        if self.claim_discovery():
+            self.run_discovery()
+
+    def run_discovery(self):
+        """With the slot claimed: browse, publish the candidates, release the slot."""
+        found = []
+        try:
+            self.emit()
+            found = self.discover_now()
+        finally:
+            with self.lock:
+                self.candidates, self.discovering = found, False
+            self.emit()
+
+    # -- pairing
+    def pairing_current(self, ip, generation):
+        """Still the pairing this attempt started for (call with the lock held)."""
+        return self.pair_ip == ip and self.pair_generation == generation
+
+    def try_pair(self):
+        with self.lock:
+            ip, generation = self.pair_ip, self.pair_generation
+        if not ip:
+            return
+        try:
+            _, cfg, peer = https_request(ip, "GET", "/api/0/config")
+            cfg = cfg if isinstance(cfg, dict) else {}
+            bridge_id = str((cfg or {}).get("bridgeid", "")).upper()
+            if not BRIDGE_ID_RE.match(bridge_id) or peer[1] != bridge_id:
+                with self.lock:
+                    if not self.pairing_current(ip, generation):
+                        return
+                    self.set_error("errNotHue", "%s does not look like a Hue bridge", ip)
+                    self.pair_ip = ""
+                    self.phase = "unpaired"
+                return
+            with self.lock:
+                if not self.pairing_current(ip, generation):
+                    return   # Cancel, Unpair or a new Pair during the first request: no key request
+            host = clean(socket.gethostname(), 19) or "pc"
+            _, resp, peer2 = https_request(ip, "POST", "/api",
+                                           {"devicetype": "omarchy_hue_lights#" + host, "generateclientkey": True})
+            if peer2 != peer:
+                raise PinError("certificate changed during pairing")
+            entry = resp[0] if isinstance(resp, list) and resp and isinstance(resp[0], dict) else {}
+            if not isinstance(entry.get("success", {}), dict) or not isinstance(entry.get("error", {}), dict):
+                entry = {}
+            key = (entry.get("success") or {}).get("username")
+            client_key = (entry.get("success") or {}).get("clientkey")
+            key = key if isinstance(key, str) and APP_KEY_RE.fullmatch(key) else None
+            client_key = client_key if isinstance(client_key, str) and CLIENT_KEY_RE.fullmatch(client_key) else None
+            with self.lock:
+                if not self.pairing_current(ip, generation):
+                    return   # a reply for an attempt that was cancelled or replaced: nothing kept
+                self.remember_secrets(key, client_key)
+            if key:
+                config = {
+                    "ip": ip, "bridge_id": bridge_id, "fingerprint": peer[0],
+                    "app_key": key,
+                    "name": clean(cfg.get("name") or "Hue Bridge"), "model": clean(cfg.get("modelid") or ""),
+                }
+                with self.lock:
+                    if not self.pairing_current(ip, generation):
+                        return
+                    save_config(config)
+                    self.conn_generation += 1
+                    self.rooms, self.light_count, self.on_count, self.pending = [], 0, 0, {}
+                    self.bridge_home_gl, self.bridge_schedules, self.api_queue = "", [], []
+                    self.bridge_model_id, self.sensors, self._sensor_service_owners, self.motion_areas = "", [], {}, []
+                    self.motion_area_candidates, self.motion_area_candidate_rooms = 0, []
+                    self.entertainment_areas, self._light_to_ent_service = [], {}
+                    if self.floorplan and self.floorplan.get("bridge_id") and self.floorplan["bridge_id"] != bridge_id:
+                        self.floorplan = None
+                    self._rebuild_schedules()
+                    self.config, self.pair_ip, self.phase, self.error = config, "", "connecting", ""
+                self._reset_sse()
+                self.wake.set()
+            elif (entry.get("error") or {}).get("type") == 101:
+                with self.lock:
+                    if self.pairing_current(ip, generation):
+                        self.error = ""  # link button not pressed yet: keep asking
+            else:
+                with self.lock:
+                    if not self.pairing_current(ip, generation):
+                        return
+                    kind = (entry.get("error") or {}).get("type")
+                    self.set_error("errPairFailed", "Pairing failed: %s",
+                                   "bridge error %d" % kind if type(kind) is int and 0 <= kind < 100000 else "bridge error")
+        except (OSError, socket.timeout, http.client.HTTPException, PinError, ValueError) as exc:
+            with self.lock:
+                if not self.pairing_current(ip, generation):
+                    return
+                self.set_error("errCannotReach", "Cannot reach %s (%s)", ip, self.safe(exc, 60))
+
+    # -- control commands
+    def _capture_states(self, kind, rid):
+        """Capture current light and room states before an optimistic update (lock held)."""
+        light_state = None
+        room_states = {}
+        for room in self.rooms:
+            if room["kind"] == "room" and valid_uuid(room["id"]):
+                room_states[room["id"]] = {"on": room["on"], "bri": room["bri"]}
+            if kind == "light" and light_state is None:
+                for light in room["lights"]:
+                    if light["id"] == rid:
+                        light_state = {"on": light["on"], "bri": light["bri"]}
+                        break
+        return light_state, room_states
+
+    def _collect_transitions(self, kind, rid, old_light, old_rooms):
+        """Compare current states against pre-mutation snapshots (lock held)."""
+        transitions = []
+        if kind == "light" and old_light is not None:
+            for room in self.rooms:
+                for light in room["lights"]:
+                    if light["id"] == rid:
+                        new_light = {"on": light["on"], "bri": light["bri"]}
+                        if new_light != old_light:
+                            transitions.append(("light", rid, old_light, new_light))
+                        break
+                else:
+                    continue
+                break
+        for room in self.rooms:
+            if room["kind"] == "room" and room["id"] in old_rooms:
+                new_rs = {"on": room["on"], "bri": room["bri"]}
+                if new_rs != old_rooms[room["id"]]:
+                    transitions.append(("room", room["id"], old_rooms[room["id"]], new_rs))
+        return transitions
+
+    def queue(self, kind, rid, body, from_rule=False):
+        if kind == "light" and is_extra_resource(rid):
+            mgr = getattr(self, "providers_mgr", None)
+            if not mgr:
+                return False
+            with self.lock:
+                if not self.known("light", rid):
+                    return False
+                self._apply_extra_optimistic(rid, body)
+                if not mgr.queue_command("light", rid, body):
+                    return False
+            if not from_rule:
+                self.emit()
+            return True
+        with self.lock:
+            if not self.may_queue(kind, rid):
+                return False
+            old_light, old_rooms = (None, {})
+            if not from_rule and getattr(self, "rules", None):
+                old_light, old_rooms = self._capture_states(kind, rid)
+            key = (kind, rid)
+            merged = dict(self.pending.get(key, {}))
+            merged.update(body)
+            self.pending[key] = merged
+            self.apply_optimistic(kind, rid, body)
+            self.refresh_hold_until = time.time() + 1.0
+            if not from_rule and getattr(self, "rules", None):
+                transitions = self._collect_transitions(kind, rid, old_light, old_rooms)
+                if transitions:
+                    self.evaluate_rules(transitions)
+        if not from_rule:
+            self.emit()
+            self.wake.set()
+        return True
+
+    def all_off(self):
+        """Every room that is on, and every light in no room that is on: all commands queued at
+        once, the model updated in one pass, one snapshot and one wake-up (not one per light)."""
+        with self.lock:
+            items = []
+            for room in self.rooms:
+                if room["kind"] == "room" and room["on"] and valid_uuid(room["grouped_light"]):
+                    items.append(("grouped_light", room["grouped_light"]))
+                elif room["kind"] == "other":
+                    items += [("light", light["id"]) for light in room["lights"] if light["on"]]
+            if not items:
+                return
+            for key in items:
+                self.pending[key] = {**self.pending.get(key, {}), "on": {"on": False}}
+            groups = {rid for kind, rid in items if kind == "grouped_light"}
+            off = {rid for kind, rid in items if kind == "light"}
+            for room in self.rooms:
+                if room["grouped_light"] in groups:
+                    off.update(light["id"] for light in room["lights"])
+            for room in self.rooms:
+                for light in room["lights"]:
+                    if light["id"] in off:
+                        light["on"] = False
+                lit = sum(1 for light in room["lights"] if light["on"])
+                room["on_count"] = lit
+                room["on"] = bool(lit) and room["grouped_light"] not in groups
+            self.on_count = sum(1 for r in self.rooms if r["kind"] != "zone" for l in r["lights"] if l["on"])
+            self.refresh_hold_until = time.time() + 1.0
+        self.emit()
+        self.wake.set()
+
+    def all_on(self, exclude_rooms=None):
+        """Turn on all rooms (or via bridge_home when nothing is excluded) and unassigned lights."""
+        excluded = set()
+        if isinstance(exclude_rooms, list):
+            excluded = {r for r in exclude_rooms if valid_uuid(r)}
+        with self.lock:
+            home_gl = getattr(self, "bridge_home_gl", "")
+            items = []
+            on_ids = set()
+            if not excluded and valid_uuid(home_gl):
+                items.append(("grouped_light", home_gl))
+                for room in self.rooms:
+                    on_ids.update(light["id"] for light in room["lights"])
+            else:
+                for room in self.rooms:
+                    if room["kind"] == "room" and room["id"] not in excluded:
+                        if valid_uuid(room["grouped_light"]):
+                            items.append(("grouped_light", room["grouped_light"]))
+                        on_ids.update(light["id"] for light in room["lights"])
+                    elif room["kind"] == "other":
+                        for light in room["lights"]:
+                            items.append(("light", light["id"]))
+                            on_ids.add(light["id"])
+            if not items:
+                return
+            for key in items:
+                if key in self.pending or len(self.pending) < MAX_PENDING:
+                    self.pending[key] = {**self.pending.get(key, {}), "on": {"on": True}}
+            for room in self.rooms:
+                for light in room["lights"]:
+                    if light["id"] in on_ids:
+                        light["on"] = True
+                lit = [light for light in room["lights"] if light["on"]]
+                room["on_count"] = len(lit)
+                room["on"] = bool(lit)
+                room["color"] = blend_colors([l["color"] for l in lit])
+            self.on_count = sum(1 for r in self.rooms if r["kind"] != "zone" for l in r["lights"] if l["on"])
+            self.refresh_hold_until = time.time() + 1.0
+        self.emit()
+        self.wake.set()
+
+    def apply_optimistic(self, kind, rid, body):
+        on = body.get("on", {}).get("on") if "on" in body else None
+        bri = body.get("dimming", {}).get("brightness") if "dimming" in body else None
+        mirek = body.get("color_temperature", {}).get("mirek") if "color_temperature" in body else None
+        xy = body.get("color", {}).get("xy") if "color" in body else None
+        effect = body.get("effects", {}).get("effect") if "effects" in body else None
+        for room in self.rooms:
+            targets = []
+            if kind == "grouped_light" and room["grouped_light"] == rid:
+                targets = room["lights"]
+                if on is not None:
+                    room["on"] = on
+                if bri is not None:
+                    room["bri"], room["on"] = bri, True
+                if mirek is not None or xy is not None or (effect is not None and effect != "no_effect"):
+                    room["on"] = True
+            elif kind == "light":
+                targets = [l for l in room["lights"] if l["id"] == rid]
+            for light in targets:
+                if on is not None:
+                    light["on"] = on
+                if bri is not None:
+                    light["bri"], light["on"] = bri, True
+                if mirek is not None:
+                    light["mirek"] = mirek
+                    light["color"] = mirek_to_hex(mirek)
+                    light["on"] = True
+                if xy is not None:
+                    light["color"] = xy_to_hex(xy.get("x"), xy.get("y"))
+                    light["mirek"] = None
+                    light["on"] = True
+                if effect is not None:
+                    light["effect"] = effect
+                    if effect != "no_effect":
+                        light["on"] = True
+            if kind == "light" and targets:
+                lit = [l for l in room["lights"] if l["on"]]
+                room["on"], room["on_count"] = bool(lit), len(lit)
+                room["color"] = blend_colors([l["color"] for l in lit])
+                if lit and room["grouped_light"] == "":
+                    room["bri"] = round(sum(l["bri"] for l in lit) / len(lit), 1)
+            elif kind == "grouped_light" and targets:
+                lit = [l for l in room["lights"] if l["on"]]
+                room["on_count"] = len(lit)
+                room["color"] = blend_colors([l["color"] for l in lit])
+        self.on_count = sum(1 for r in self.rooms if r["kind"] != "zone" for l in r["lights"] if l["on"])
+
+    # -- schedules & theme helpers
+    def _rebuild_schedules(self):
+        """Keep self.schedules as bridge_schedules + local_schedules (call with lock held)."""
+        self.schedules = list(getattr(self, "bridge_schedules", [])) + list(getattr(self, "local_schedules", []))
+
+    def _find_light(self, light_id):
+        """Return light dict for light_id in current model (call with lock held), or None."""
+        for room in self.rooms:
+            for light in room["lights"]:
+                if light["id"] == light_id:
+                    return light
+        return None
+
+    def _target_name(self, target_kind, target_id):
+        """Resolve display name for a light, room, or zone UUID (call with lock held)."""
+        if target_kind == "light":
+            light = self._find_light(target_id)
+            return light.get("name", "") if light else ""
+        if target_kind in ("room", "zone"):
+            for room in self.rooms:
+                if room["kind"] == target_kind and room["id"] == target_id:
+                    return room.get("name", "")
+        return ""
+
+    def check_local_schedules(self, now=None):
+        """Check enabled local schedules against local (weekday, HH:MM), firing at most once per minute."""
+        if now is None:
+            lt = time.localtime()
+            year, month, day, hour, minute, wday = lt.tm_year, lt.tm_mon, lt.tm_mday, lt.tm_hour, lt.tm_min, lt.tm_wday
+        elif hasattr(now, "tm_year"):
+            year, month, day, hour, minute, wday = now.tm_year, now.tm_mon, now.tm_mday, now.tm_hour, now.tm_min, now.tm_wday
+        elif hasattr(now, "weekday"):
+            year, month, day, hour, minute, wday = now.year, now.month, now.day, now.hour, now.minute, now.weekday()
+        else:
+            year, month, day, hour, minute, wday = now
+        day_short = DAY_ORDER[int(wday) % 7]
+        hhmm = "%02d:%02d" % (int(hour), int(minute))
+        bucket = "%04d-%02d-%02d %02d:%02d" % (int(year), int(month), int(day), int(hour), int(minute))
+
+        fired = 0
+        with self.lock:
+            if not self.config or not self.local_schedules:
+                return 0
+            # Prune previous-minute buckets so dict stays tiny
+            self._local_sched_fired = {sid: b for sid, b in self._local_sched_fired.items() if b == bucket}
+            for sched in self.local_schedules:
+                if not sched.get("enabled"):
+                    continue
+                if sched.get("trigger_kind", "time") != "time" or sched.get("time") != hhmm:
+                    continue
+                days = sched.get("days") or []
+                if days and day_short not in days:
+                    continue
+                sid = sched["id"]
+                if self._local_sched_fired.get(sid) == bucket or sched.get("last_fired") == bucket:
+                    self._local_sched_fired[sid] = bucket
+                    continue
+                # Verify the target can be queued before claiming the minute on disk.
+                action = sched.get("action")
+                dispatch_ready = False
+                if action == "scene":
+                    scene_id = sched.get("scene_id", "")
+                    dispatch_ready = valid_uuid(scene_id) and self.may_queue("scene", scene_id)
+                else:
+                    tkind = sched.get("target_kind")
+                    tid = sched.get("target_id")
+                    if tkind == "light":
+                        dispatch_ready = self.may_queue("light", tid)
+                    elif tkind in ("room", "zone"):
+                        for room in self.rooms:
+                            if room["kind"] == tkind and room["id"] == tid:
+                                if valid_uuid(room.get("grouped_light")):
+                                    dispatch_ready = self.may_queue("grouped_light", room["grouped_light"])
+                                else:
+                                    dispatch_ready = any(self.may_queue("light", l["id"]) for l in room["lights"])
+                                break
+                if not dispatch_ready:
+                    continue
+                if not claim_local_schedule_bucket(sid, bucket):
+                    sched["last_fired"] = bucket
+                    self._local_sched_fired[sid] = bucket
+                    continue
+                ok = False
+                if action == "scene":
+                    scene_id = sched.get("scene_id", "")
+                    if valid_uuid(scene_id) and self.may_queue("scene", scene_id):
+                        recall = {"action": "active"}
+                        if sched.get("fade_min", 0) > 0:
+                            recall["duration"] = int(sched["fade_min"]) * 60000
+                        self.pending[("scene", scene_id)] = {"recall": recall}
+                        self.refresh_hold_until = 0
+                        ok = True
+                else:
+                    body = {"on": {"on": action == "on"}}
+                    if action == "on" and sched.get("bri") is not None:
+                        body["dimming"] = {"brightness": round(clamp(float(sched["bri"]), 1.0, 100.0), 1)}
+                    if sched.get("fade_min", 0) > 0:
+                        body["dynamics"] = {"duration": int(sched["fade_min"]) * 60000}
+                    tkind = sched.get("target_kind")
+                    tid = sched.get("target_id")
+                    if tkind == "light":
+                        ok = self.queue("light", tid, body, from_rule=True)
+                    elif tkind in ("room", "zone"):
+                        for room in self.rooms:
+                            if room["kind"] == tkind and room["id"] == tid:
+                                if valid_uuid(room.get("grouped_light")):
+                                    ok = self.queue("grouped_light", room["grouped_light"], body, from_rule=True)
+                                else:
+                                    for light in room["lights"]:
+                                        if self.queue("light", light["id"], body, from_rule=True):
+                                            ok = True
+                                break
+                if ok:
+                    sched["last_fired"] = bucket
+                    self._local_sched_fired[sid] = bucket
+                    fired += 1
+        if fired:
+            self.emit()
+            self.wake.set()
+        return fired
+
+    # -- dependency / linked-light rule engine
+    def _target_is_on(self, tkind, tid):
+        if tkind == "light":
+            for room in self.rooms:
+                for light in room["lights"]:
+                    if light["id"] == tid:
+                        return bool(light["on"])
+        elif tkind == "room":
+            for room in self.rooms:
+                if room["id"] == tid and room["kind"] == "room":
+                    return bool(room["on"])
+        return False
+
+    def _suppress_target(self, tkind, tid, expires, expected_on=None):
+        entry = (expires, expected_on)
+        self.echo_suppress[(tkind, tid)] = entry
+        if tkind == "room":
+            for room in self.rooms:
+                if room["id"] == tid and room["kind"] == "room":
+                    if room.get("grouped_light"):
+                        self.echo_suppress[("grouped_light", room["grouped_light"])] = entry
+                    for light in room["lights"]:
+                        self.echo_suppress[("light", light["id"])] = entry
+                    break
+
+    def _dispatch_rule_target(self, target, body, recall_scene=False):
+        """Queue a rule-initiated command for a light or room target (lock held). Returns True if queued."""
+        tkind, tid = target["kind"], target["id"]
+        if tkind == "light":
+            return self.queue("light", tid, body, from_rule=True)
+        if tkind == "room":
+            if recall_scene and target.get("scene_id"):
+                sid = target["scene_id"]
+                if is_extra_resource(sid) and getattr(self, "providers_mgr", None):
+                    return self.providers_mgr.queue_command("scene", sid, {})
+                if self.may_queue("scene", sid):
+                    self.pending[("scene", sid)] = {"recall": {"action": "active"}}
+                    self.refresh_hold_until = 0
+                    return True
+            for room in self._all_rooms():
+                if room["id"] == tid and room["kind"] == "room":
+                    if valid_uuid(room.get("grouped_light")):
+                        return self.queue("grouped_light", room["grouped_light"], body, from_rule=True)
+                    queued_any = False
+                    for light in room["lights"]:
+                        if self.queue("light", light["id"], body, from_rule=True):
+                            queued_any = True
+                    return queued_any
+        return False
+
+    def evaluate_rules(self, transitions, now_mono=None, now_time=None, depth=0):
+        """Evaluate dependency rules for [(kind, rid, old_state, new_state), ...] (call with lock held)."""
+        if getattr(self, "rules_paused", False) or depth >= MAX_CASCADE_DEPTH:
+            return 0
+        rules = getattr(self, "rules", None)
+        if not rules or not self.config:
+            return 0
+        now_mono = time.monotonic() if now_mono is None else float(now_mono)
+        # Prune expired echo suppressions (supports both (expires, expected_on) and legacy bare float)
+        self.echo_suppress = {
+            k: v for k, v in self.echo_suppress.items()
+            if _echo_entry(v)[0] > now_mono
+        }
+        fired = 0
+        for kind, rid, old_state, new_state in transitions:
+            if kind not in ("desktop", "motion", "motion_area", "contact", "button") and (kind, rid) in self.echo_suppress:
+                exp, expected_on = _echo_entry(self.echo_suppress[(kind, rid)])
+                if exp > now_mono:
+                    new_on = new_state.get("on") if isinstance(new_state, dict) else None
+                    if expected_on is None or new_on is None or new_on == expected_on:
+                        continue
+                    del self.echo_suppress[(kind, rid)]
+            for rule in rules:
+                if not rule.get("enabled", True):
+                    continue
+                if rule.get("trigger_kind") != kind or rule.get("trigger_id") != rid:
+                    continue
+                if now_mono - self.rule_last_fired.get(rule["id"], -1e9) < RULE_COOLDOWN:
+                    continue
+                if not in_time_window(rule.get("time_start", ""), rule.get("time_end", ""), now=now_time):
+                    continue
+                mode = None
+                new_bri = new_state.get("bri") if isinstance(new_state, dict) else None
+                tstate = rule.get("trigger_state")
+                if kind == "desktop":
+                    mode = "desktop"
+                elif kind == "button":
+                    new_ev = new_state.get("event") if isinstance(new_state, dict) else ""
+                    if new_ev and new_ev == tstate:
+                        mode = "trigger"
+                elif kind in ("motion", "motion_area"):
+                    old_on = old_state.get("on") if isinstance(old_state, dict) else None
+                    new_on = new_state.get("on") if isinstance(new_state, dict) else None
+                    on_changed = (old_on is not None and new_on is not None and old_on != new_on)
+                    if on_changed and ((new_on is True and tstate == "motion") or (new_on is False and tstate == "clear")):
+                        mode = "trigger"
+                    elif on_changed and rule.get("mirror_off") and tstate == "motion" and new_on is False:
+                        mode = "mirror_off"
+                elif kind == "contact":
+                    old_on = old_state.get("on") if isinstance(old_state, dict) else None
+                    new_on = new_state.get("on") if isinstance(new_state, dict) else None
+                    on_changed = (old_on is not None and new_on is not None and old_on != new_on)
+                    if on_changed and ((new_on is True and tstate == "open") or (new_on is False and tstate == "closed")):
+                        mode = "trigger"
+                    elif on_changed and rule.get("mirror_off") and tstate == "open" and new_on is False:
+                        mode = "mirror_off"
+                else:
+                    old_on = old_state.get("on") if isinstance(old_state, dict) else None
+                    new_on = new_state.get("on") if isinstance(new_state, dict) else None
+                    old_bri = old_state.get("bri") if isinstance(old_state, dict) else None
+                    on_changed = (old_on is not None and new_on is not None and old_on != new_on)
+                    bri_changed = (old_bri is not None and new_bri is not None and abs(float(old_bri) - float(new_bri)) >= 0.5)
+                    if on_changed and ((new_on is True and tstate == "on") or (new_on is False and tstate == "off")):
+                        mode = "trigger"
+                    elif on_changed and rule.get("mirror_off") and tstate == "on" and new_on is False:
+                        mode = "mirror_off"
+                    elif (not on_changed) and bri_changed and rule.get("match_bri") and tstate == "on" and new_on is True:
+                        mode = "match_bri"
+                if mode is None:
+                    continue
+                applied = 0
+                for target in rule["targets"]:
+                    expected_on = None
+                    if mode == "mirror_off":
+                        ok = self._dispatch_rule_target(target, {"on": {"on": False}})
+                        expected_on = False
+                    elif mode == "match_bri":
+                        if target["action"] != "on" or target.get("scene_id"):
+                            continue
+                        if rule.get("only_if_off") and self._target_is_on(target["kind"], target["id"]):
+                            continue
+                        b = round(clamp(float(new_bri), 1.0, 100.0), 1)
+                        ok = self._dispatch_rule_target(target, {"on": {"on": True}, "dimming": {"brightness": b}})
+                        expected_on = True
+                    else:
+                        if rule.get("only_if_off") and self._target_is_on(target["kind"], target["id"]):
+                            continue
+                        if target["action"] == "off":
+                            ok = self._dispatch_rule_target(target, {"on": {"on": False}})
+                            expected_on = False
+                        else:
+                            expected_on = True
+                            if target.get("scene_id") and target["kind"] == "room" and self.known("scene", target["scene_id"]):
+                                ok = self._dispatch_rule_target(target, {}, recall_scene=True)
+                            else:
+                                body = {"on": {"on": True}}
+                                if mode == "trigger" and rule.get("match_bri") and new_bri is not None:
+                                    body["dimming"] = {"brightness": round(clamp(float(new_bri), 1.0, 100.0), 1)}
+                                elif target.get("bri") is not None:
+                                    body["dimming"] = {"brightness": round(clamp(float(target["bri"]), 1.0, 100.0), 1)}
+                                ok = self._dispatch_rule_target(target, body)
+                    if ok:
+                        self._suppress_target(target["kind"], target["id"], now_mono + RULE_ECHO_WINDOW,
+                                              expected_on=expected_on)
+                        applied += 1
+                if applied:
+                    self.rule_last_fired[rule["id"]] = now_mono
+                    detail = "%s (%d target%s)" % (mode, applied, "" if applied == 1 else "s")
+                    self.rule_log.append({
+                        "ts": int(time.time()),
+                        "rule_id": rule["id"],
+                        "rule_name": rule["name"],
+                        "detail": clean(detail, 120),
+                    })
+                    if len(self.rule_log) > MAX_RULE_LOG:
+                        self.rule_log = self.rule_log[-MAX_RULE_LOG:]
+                    fired += 1
+        return fired
+
+    # -- SSE eventstream
+    def apply_sse_updates(self, updates, generation=None, now_mono=None, now_time=None):
+        """Apply parsed SSE (kind, rid, changes) updates to in-memory state, run rules, and emit."""
+        if not updates:
+            return False
+        changed = False
+        rules_fired = 0
+        with self.lock:
+            if generation is not None and not self.connection_current(generation):
+                return False
+            transitions = []
+            sensors = getattr(self, "sensors", [])
+            motion_areas = getattr(self, "motion_areas", [])
+            svc_owners = getattr(self, "_sensor_service_owners", {})
+            motion_areas_changed = False
+            for kind, rid, changes in updates:
+                if kind == "light":
+                    old_light = None
+                    old_rooms = {}
+                    for room in self.rooms:
+                        if room["kind"] == "room" and valid_uuid(room["id"]):
+                            old_rooms[room["id"]] = {"on": room["on"], "bri": room["bri"]}
+                        for light in room["lights"]:
+                            if light["id"] == rid:
+                                if old_light is None:
+                                    old_light = {"on": light["on"], "bri": light["bri"]}
+                                if "on" in changes:
+                                    light["on"] = changes["on"]
+                                if "bri" in changes:
+                                    light["bri"] = changes["bri"]
+                                if "mirek" in changes:
+                                    light["mirek"] = changes["mirek"]
+                                    if changes["mirek"] is not None:
+                                        light["color"] = mirek_to_hex(changes["mirek"])
+                                if "xy" in changes:
+                                    light["color"] = xy_to_hex(changes["xy"][0], changes["xy"][1])
+                                    light["mirek"] = None
+                                if "effect" in changes:
+                                    light["effect"] = changes["effect"]
+                                if "name" in changes:
+                                    light["name"] = changes["name"]
+                                lit = [l for l in room["lights"] if l["on"]]
+                                room["on"], room["on_count"] = bool(lit), len(lit)
+                                room["color"] = blend_colors([l["color"] for l in lit])
+                                if lit and room["grouped_light"] == "":
+                                    room["bri"] = round(sum(l["bri"] for l in lit) / len(lit), 1)
+                                changed = True
+                    if old_light is not None:
+                        for room in self.rooms:
+                            for light in room["lights"]:
+                                if light["id"] == rid:
+                                    new_light = {"on": light["on"], "bri": light["bri"]}
+                                    if new_light != old_light:
+                                        transitions.append(("light", rid, old_light, new_light))
+                                    break
+                            else:
+                                continue
+                            break
+                        for room in self.rooms:
+                            if room["kind"] == "room" and room["id"] in old_rooms:
+                                new_rs = {"on": room["on"], "bri": room["bri"]}
+                                if new_rs != old_rooms[room["id"]]:
+                                    transitions.append(("room", room["id"], old_rooms[room["id"]], new_rs))
+                elif kind == "grouped_light":
+                    for room in self.rooms:
+                        if room["grouped_light"] == rid:
+                            old_rs = {"on": room["on"], "bri": room["bri"]}
+                            if "on" in changes:
+                                room["on"] = changes["on"]
+                            if "bri" in changes:
+                                room["bri"] = changes["bri"]
+                            new_rs = {"on": room["on"], "bri": room["bri"]}
+                            changed = True
+                            if new_rs != old_rs:
+                                transitions.append(("grouped_light", rid, old_rs, new_rs))
+                                if room["kind"] == "room" and valid_uuid(room["id"]):
+                                    transitions.append(("room", room["id"], old_rs, new_rs))
+                elif kind == "motion":
+                    for sensor in sensors:
+                        if sensor.get("kind") == "motion" and sensor.get("id") == rid:
+                            old_m = bool(sensor.get("motion", False))
+                            if "enabled" in changes:
+                                sensor["enabled"] = changes["enabled"]
+                            if "motion" in changes:
+                                sensor["motion"] = changes["motion"]
+                            if "sensitivity" in changes:
+                                smax = sensor.get("sensitivity_max")
+                                s = changes["sensitivity"]
+                                sensor["sensitivity"] = int(clamp(s, 0, smax)) if smax is not None else s
+                            changed = True
+                            new_m = bool(sensor.get("motion", False))
+                            if "motion" in changes and new_m != old_m:
+                                transitions.append(("motion", sensor["id"], {"on": old_m}, {"on": new_m}))
+                            break
+                elif kind == "contact":
+                    for sensor in sensors:
+                        if sensor.get("kind") == "contact" and sensor.get("id") == rid:
+                            old_o = bool(sensor.get("open", False))
+                            if "enabled" in changes:
+                                sensor["enabled"] = changes["enabled"]
+                            if "open" in changes:
+                                sensor["open"] = changes["open"]
+                            changed = True
+                            new_o = bool(sensor.get("open", False))
+                            if "open" in changes and new_o != old_o:
+                                transitions.append(("contact", sensor["id"], {"on": old_o}, {"on": new_o}))
+                            break
+                elif kind == "button":
+                    owner_id = changes.get("owner_id") or svc_owners.get(rid) or ""
+                    for sensor in sensors:
+                        if sensor.get("kind") != "button":
+                            continue
+                        if (rid in (sensor.get("button_ids") or ())
+                                or sensor.get("id") == rid
+                                or (owner_id and sensor.get("device_id") == owner_id)):
+                            if "last_event" in changes:
+                                raw_ev = changes["last_event"]
+                                sensor["last_event"] = raw_ev
+                                changed = True
+                                if raw_ev in ("long_press", "long_release"):
+                                    norm_ev = "long_press"
+                                elif raw_ev in ("short_release", "initial_press"):
+                                    norm_ev = "press"
+                                else:
+                                    norm_ev = ""
+                                if norm_ev:
+                                    transitions.append(("button", sensor["id"], {"event": ""}, {"event": norm_ev}))
+                            break
+                elif kind == "temperature":
+                    owner_id = changes.get("owner_id") or svc_owners.get(rid) or ""
+                    if owner_id and "temperature" in changes:
+                        for sensor in sensors:
+                            if sensor.get("device_id") == owner_id:
+                                sensor["temperature"] = changes["temperature"]
+                                changed = True
+                elif kind == "light_level":
+                    owner_id = changes.get("owner_id") or svc_owners.get(rid) or ""
+                    if owner_id and "lux" in changes:
+                        for sensor in sensors:
+                            if sensor.get("device_id") == owner_id:
+                                sensor["lux"] = changes["lux"]
+                                changed = True
+                elif kind == "device_power":
+                    owner_id = changes.get("owner_id") or svc_owners.get(rid) or ""
+                    if owner_id:
+                        for sensor in sensors:
+                            if sensor.get("device_id") == owner_id:
+                                if "battery" in changes:
+                                    sensor["battery"] = changes["battery"]
+                                    changed = True
+                                if "battery_state" in changes:
+                                    sensor["battery_state"] = changes["battery_state"]
+                                    changed = True
+                elif kind in ("convenience_area_motion", "security_area_motion"):
+                    owner_id = changes.get("owner_id") or ""
+                    for area in motion_areas:
+                        if area.get("convenience_id") == rid or (owner_id and area.get("id") == owner_id):
+                            old_m = bool(area.get("motion", False))
+                            if "enabled" in changes:
+                                area["enabled"] = changes["enabled"]
+                            if "motion" in changes:
+                                area["motion"] = changes["motion"]
+                            if "motion_valid" in changes:
+                                area["motion_valid"] = changes["motion_valid"]
+                            if "sensitivity" in changes:
+                                smax = area.get("sensitivity_max", 4)
+                                area["sensitivity"] = int(clamp(changes["sensitivity"], 0, smax))
+                            changed = True
+                            motion_areas_changed = True
+                            new_m = bool(area.get("motion", False))
+                            if "motion" in changes and new_m != old_m:
+                                transitions.append(("motion_area", area["id"], {"on": old_m}, {"on": new_m}))
+                            break
+                elif kind == "motion_area_configuration":
+                    for area in motion_areas:
+                        if area.get("id") == rid:
+                            if "enabled" in changes:
+                                area["enabled"] = changes["enabled"]
+                            if "name" in changes:
+                                area["name"] = changes["name"]
+                            changed = True
+                            motion_areas_changed = True
+                            break
+            if motion_areas_changed:
+                annotate_motion_aware_lights(self.rooms, motion_areas)
+            if changed:
+                self.on_count = sum(1 for r in self.rooms if r["kind"] != "zone" for l in r["lights"] if l["on"])
+                if transitions:
+                    rules_fired = self.evaluate_rules(transitions, now_mono=now_mono, now_time=now_time)
+        if changed:
+            self.emit()
+        if rules_fired:
+            self.wake.set()
+        return changed
+
+    def handle_sse_line(self, line, generation=None, now_mono=None, now_time=None):
+        updates = parse_sse_data_line(line)
+        if updates:
+            return self.apply_sse_updates(updates, generation=generation, now_mono=now_mono, now_time=now_time)
+        return False
+
+    def sse_loop(self):
+        """Background daemon listening on /eventstream/clip/v2 with pinned TLS and exponential backoff."""
+        backoff_idx = 0
+        last_gen = -1
+        while not self._stop.is_set():
+            config, generation = self.connection()
+            if generation != last_gen:
+                backoff_idx = 0
+                last_gen = generation
+            if not config:
+                self.sse_wake.wait(5.0)
+                self.sse_wake.clear()
+                continue
+            pin = {"fingerprint": config.get("fingerprint"), "bridge_id": config.get("bridge_id", "")}
+            conn = resp = sock = None
+            connected_ok = False
+            try:
+                conn, resp, sock = open_sse_stream(config["ip"], config["app_key"], pin)
+                with self.lock:
+                    if not self.connection_current(generation) or self._stop.is_set():
+                        continue
+                    self._sse_sock = sock
+                connected_ok = True
+                backoff_idx = 0
+
+                def read_chunk():
+                    while not self._stop.is_set():
+                        with self.lock:
+                            if not self.connection_current(generation):
+                                return b""
+                        try:
+                            return resp.read1(8192)
+                        except socket.timeout:
+                            return None
+
+                for raw_line in iter_bounded_lines(read_chunk, max_line=MAX_BODY, line_timeout=SSE_LINE_TIMEOUT):
+                    if self._stop.is_set():
+                        break
+                    with self.lock:
+                        if not self.connection_current(generation):
+                            break
+                    self.handle_sse_line(raw_line, generation=generation)
+            except (PinError, PermissionError):
+                backoff_idx = len(SSE_BACKOFF) - 1
+            except (OSError, http.client.HTTPException, ValueError):
+                pass
+            finally:
+                with self.lock:
+                    if self._sse_sock is sock:
+                        self._sse_sock = None
+                if resp is not None:
+                    try:
+                        resp.close()
+                    except OSError:
+                        pass
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except OSError:
+                        pass
+                if sock is not None:
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+            if self._stop.is_set():
+                break
+            with self.lock:
+                gen_changed = (self.conn_generation != last_gen) or (not self.config) or bool(self.pair_ip)
+            if gen_changed:
+                continue
+            delay = SSE_BACKOFF[min(backoff_idx, len(SSE_BACKOFF) - 1)]
+            if not connected_ok and backoff_idx < len(SSE_BACKOFF) - 1:
+                backoff_idx += 1
+            self.sse_wake.wait(delay)
+            self.sse_wake.clear()
+
+    def send_api_queue(self):
+        """Send one queued schedule/bridge API call (POST/PUT/DELETE) and trigger refresh.
+        Supports optional 4th `meta` dict for linking created room/zone IDs back into `floorplan.json`
+        and aborting + rolling back detached devices if a sync batch fails mid-way."""
+        config, generation = self.connection()
+        if not config:
+            return False
+        with self.lock:
+            if not self.api_queue:
+                return False
+            item = self.api_queue.pop(0)
+        if len(item) == 4:
+            method, path, body, meta = item
+            meta = meta if isinstance(meta, dict) else {}
+        else:
+            method, path, body = item
+            meta = {}
+        batch_id = meta.get("batch_id")
+        try:
+            resp = self.api(method, path, body, config=config)
+            emit_now = False
+            with self.lock:
+                if self.connection_current(generation):
+                    self.last_refresh = 0.0
+                    self.refresh_hold_until = 0.0
+                    if batch_id is not None and meta.get("rollback"):
+                        self._batch_rollbacks.setdefault(batch_id, []).append(meta["rollback"])
+                    link_box_id = meta.get("link_box_id")
+                    if link_box_id and isinstance(resp, dict) and isinstance(self.floorplan, dict):
+                        data = resp.get("data")
+                        created_rid = None
+                        if isinstance(data, list) and data and isinstance(data[0], dict):
+                            cand = data[0].get("rid")
+                            if valid_uuid(cand):
+                                created_rid = cand
+                        if created_rid:
+                            for box in self.floorplan.get("boxes") or []:
+                                if box.get("id") == link_box_id and not box.get("hue_id"):
+                                    box["hue_id"] = created_rid
+                                    try:
+                                        save_floorplan(self.floorplan)
+                                    except OSError as save_exc:
+                                        self.set_error("errCommand", "Command failed (%s)", self.safe(save_exc, 60))
+                                    emit_now = True
+                                    break
+                    if batch_id is not None:
+                        still_in_batch = any(
+                            len(q) == 4 and isinstance(q[3], dict) and q[3].get("batch_id") == batch_id
+                            for q in self.api_queue
+                        )
+                        if not still_in_batch:
+                            self._batch_rollbacks.pop(batch_id, None)
+            if emit_now:
+                self.emit()
+        except (BridgeError, OSError, PinError, PermissionError, socket.timeout, http.client.HTTPException) as exc:
+            rollbacks = []
+            with self.lock:
+                if self.connection_current(generation):
+                    if isinstance(exc, BridgeError):
+                        self.set_error("errCommand", "Command failed (%s)", "bridge error")
+                    else:
+                        self.set_error("errCommand", "Command failed (%s)", self.safe(exc, 60))
+                    if batch_id is not None:
+                        self.api_queue = [
+                            q for q in self.api_queue
+                            if not (len(q) == 4 and isinstance(q[3], dict) and q[3].get("batch_id") == batch_id)
+                        ]
+                        rollbacks = self._batch_rollbacks.pop(batch_id, [])
+            rollback_failed = False
+            for rb_method, rb_path, rb_body in reversed(rollbacks):
+                try:
+                    self.api(rb_method, rb_path, rb_body, config=config)
+                except (BridgeError, OSError, PinError, PermissionError, socket.timeout, http.client.HTTPException):
+                    rollback_failed = True
+            if rollbacks:
+                with self.lock:
+                    if self.connection_current(generation):
+                        self.last_refresh = 0.0
+                        self.refresh_hold_until = 0.0
+                        if rollback_failed:
+                            self.set_error("errCommand", "Command failed (%s)", "room sync rollback failed")
+                self.emit()
+        return True
+
+    def send_pending(self):
+        sent = False
+        now = time.time()
+        config, generation = self.connection()
+        with self.lock:
+            items = list(self.pending.items()) if config else []
+        for (kind, rid), body in items:
+            interval = GROUP_INTERVAL if kind == "grouped_light" else LIGHT_INTERVAL
+            if now - self.last_sent.get(kind, 0) < interval:
+                continue
+            with self.lock:
+                if not self.connection_current(generation):
+                    break   # Unpair, Pair or a relocation since the batch started
+                if self.pending.get((kind, rid)) is not body:
+                    continue
+                del self.pending[(kind, rid)]
+            try:
+                self.api("PUT", "/clip/v2/resource/%s/%s" % (kind, rid), body, config=config)
+            except BridgeError:
+                with self.lock:
+                    if self.connection_current(generation):
+                        self.set_error("errCommand", "Command failed (%s)", "bridge error")
+            except (OSError, PinError, PermissionError, socket.timeout, http.client.HTTPException) as exc:
+                with self.lock:
+                    if self.connection_current(generation):
+                        self.set_error("errCommand", "Command failed (%s)", self.safe(exc, 60))
+            self.last_sent[kind] = time.time()
+            sent = True
+        return sent
+
+    def handle(self, cmd):
+        name = cmd.get("cmd")
+        if name == "open":
+            self.panel_open = True
+            self.wake.set()
+        elif name == "closed":
+            self.panel_open = False
+        elif name == "refresh":
+            self.last_refresh = 0
+            if getattr(self, "providers_mgr", None):
+                self.providers_mgr.trigger_refresh()
+            self.wake.set()
+        elif name == "discover":
+            self.start_discovery()
+        elif name == "pair":
+            ip = str(cmd.get("ip", "")).strip()
+            if not valid_bridge_ip(ip):
+                with self.lock:
+                    self.set_error("errEnterIp", "Enter the bridge's local IPv4 address")
+                self.emit()
+                return
+            with self.lock:
+                self.pair_generation += 1
+                self.conn_generation += 1
+                self.pending = {}   # commands for the old connection are not sent any more
+                if hasattr(self, "api_queue"):
+                    self.api_queue = []
+                self.pair_ip, self.pair_until, self.phase, self.error = ip, time.time() + PAIR_WINDOW, "pairing", ""
+            self._reset_sse()
+            self.emit()
+            self.wake.set()
+        elif name == "cancel_pair":
+            with self.lock:
+                self.pair_generation += 1
+                self.pair_ip, self.phase = "", ("connecting" if self.config else "unpaired")
+            self._reset_sse()
+            self.emit()
+        elif name == "unpair":
+            # Stop synth before clearing state (outside lock to avoid join deadlock)
+            if hasattr(self, "synth"):
+                self.synth.stop(emit=False)
+            # One lock for invalidating, deleting and clearing: try_pair validates and saves
+            # under it too, so no pairing reply can save a key between deletion and clearing.
+            with self.lock:
+                self.pair_generation += 1
+                self.conn_generation += 1
+                removed = remove_config()
+                self.pair_ip = ""
+                self.config, self.rooms, self.light_count, self.on_count = {}, [], 0, 0
+                self.bridge_home_gl, self.bridge_schedules = "", []
+                self.bridge_model_id, self.sensors, self._sensor_service_owners, self.motion_areas = "", [], {}, []
+                self.motion_area_candidates, self.motion_area_candidate_rooms = 0, []
+                self.entertainment_areas, self._light_to_ent_service = [], {}
+                self._local_sched_fired = {}
+                self._rebuild_schedules()
+                self.schedule_script_id = DEFAULT_SCHEDULE_SCRIPT_ID
+                self.api_queue = []
+                self.echo_suppress = {}
+                self.rule_last_fired = {}
+                self._ai_seq = getattr(self, "_ai_seq", 0) + 1
+                self.ai_state = {
+                    "busy": False,
+                    "last_prompt": "",
+                    "last_reply": "",
+                    "last_actions": [],
+                    "engine": "",
+                    "error": "",
+                }
+                self.phase, self.error, self.pending = "unpaired", "", {}
+                if not removed:
+                    # Otherwise the pairing would silently come back with the next start.
+                    self.set_error("errInternal", "Something went wrong (%s)",
+                                   "the saved pairing could not be deleted: " + CONFIG_PATH)
+            self._reset_sse()
+            self.emit()
+            self.start_discovery()
+        elif name in ("light", "group") and (self.config or self._has_extra_providers()):
+            kind = "light" if name == "light" else "grouped_light"
+            rid = cmd.get("id")
+            if not valid_resource_id(rid):
+                return
+            if kind == "grouped_light" and not valid_uuid(rid):
+                return
+            body = {}
+            if isinstance(cmd.get("on"), bool):
+                body["on"] = {"on": cmd["on"]}
+            bri = cmd.get("bri")
+            if isinstance(bri, (int, float)) and not isinstance(bri, bool):
+                bri = finite(bri, None, 1.0, 100.0)
+                if bri is None:
+                    return
+                body["dimming"] = {"brightness": round(bri, 1)}
+                body["on"] = {"on": True}
+            if "mirek" in cmd and cmd["mirek"] is not None:
+                raw_m = cmd["mirek"]
+                if isinstance(raw_m, bool) or not isinstance(raw_m, (int, float)):
+                    return
+                m = finite(raw_m, None, 153.0, 500.0)
+                if m is None:
+                    return
+                body["color_temperature"] = {"mirek": int(round(m))}
+                body["on"] = {"on": True}
+            if "xy" in cmd and cmd["xy"] is not None:
+                raw_xy = cmd["xy"]
+                if not isinstance(raw_xy, (list, tuple)) or len(raw_xy) != 2:
+                    return
+                rx, ry = raw_xy[0], raw_xy[1]
+                if isinstance(rx, bool) or isinstance(ry, bool) or not isinstance(rx, (int, float)) or not isinstance(ry, (int, float)):
+                    return
+                if not (math.isfinite(rx) and math.isfinite(ry) and 0.0 <= rx <= 1.0 and 0.0 <= ry <= 1.0):
+                    return
+                body["color"] = {"xy": {"x": round(float(rx), 4), "y": round(float(ry), 4)}}
+                body["on"] = {"on": True}
+            if "effect" in cmd and cmd["effect"] is not None:
+                eff = cmd["effect"]
+                if not isinstance(eff, str) or (not is_extra_resource(rid) and EFFECT_RE.match(eff) is None) or len(eff) > 48:
+                    return
+                body["effects"] = {"effect": eff}
+                if eff != "no_effect":
+                    body["on"] = {"on": True}
+            if body:
+                self.queue(kind, rid, body)
+        elif name == "all_off" and (self.config or self._has_extra_providers()):
+            if self.config:
+                self.all_off()
+            if self._has_extra_providers():
+                extra_rooms, _, _, _, _ = self.providers_mgr.snapshot_parts()
+                for r in extra_rooms:
+                    for l in r.get("lights", []):
+                        if l.get("on"):
+                            self.queue("light", l["id"], {"on": {"on": False}}, from_rule=True)
+                self.emit()
+        elif name == "all_on" and (self.config or self._has_extra_providers()):
+            if self.config:
+                self.all_on(cmd.get("exclude_rooms"))
+            if self._has_extra_providers():
+                excluded = set(cmd.get("exclude_rooms") or []) if isinstance(cmd.get("exclude_rooms"), list) else set()
+                extra_rooms, _, _, _, _ = self.providers_mgr.snapshot_parts()
+                for r in extra_rooms:
+                    if r["id"] not in excluded:
+                        for l in r.get("lights", []):
+                            self.queue("light", l["id"], {"on": {"on": True}}, from_rule=True)
+                self.emit()
+        elif name == "scene" and (self.config or self._has_extra_providers()):
+            rid = cmd.get("id")
+            if is_extra_resource(rid) and self.providers_mgr:
+                with self.lock:
+                    if not self.known("scene", rid):
+                        return
+                self.providers_mgr.queue_command("scene", rid, {})
+            elif valid_uuid(rid) and self.config:
+                with self.lock:
+                    if not self.may_queue("scene", rid):
+                        return
+                    self.pending[("scene", rid)] = {"recall": {"action": "active"}}
+                    self.refresh_hold_until = 0
+                self.wake.set()
+        elif name == "theme_save":
+            theme = validate_theme(cmd.get("theme"))
+            if theme is None:
+                return
+            with self.lock:
+                if theme["id"] in BUILTIN_THEME_IDS:
+                    return
+                candidate = [t for t in self.custom_themes if t["id"] != theme["id"]]
+                if len(candidate) >= MAX_THEMES:
+                    return
+                candidate.append(theme)
+                save_themes(candidate)
+                self.custom_themes = candidate
+            self.emit()
+        elif name == "theme_delete":
+            tid = cmd.get("id")
+            if not isinstance(tid, str) or tid in BUILTIN_THEME_IDS:
+                return
+            with self.lock:
+                new_themes = [t for t in self.custom_themes if t["id"] != tid]
+                if len(new_themes) == len(self.custom_themes):
+                    return
+                save_themes(new_themes)
+                self.custom_themes = new_themes
+            self.emit()
+        elif name == "theme_apply" and (self.config or self._has_extra_providers()):
+            theme_id = cmd.get("theme_id")
+            light_id = cmd.get("light_id")
+            if not isinstance(theme_id, str) or not valid_resource_id(light_id):
+                return
+            body = None
+            with self.lock:
+                if not self.known("light", light_id):
+                    return
+                light = next((l for r in self._all_rooms() for l in r["lights"] if l["id"] == light_id), None)
+                theme = next((t for t in (BUILTIN_THEMES + self.custom_themes) if t["id"] == theme_id), None)
+                if light is None or theme is None:
+                    return
+                body = {
+                    "on": {"on": True},
+                    "dimming": {"brightness": round(clamp(float(theme["bri"]), 1.0, 100.0), 1)},
+                }
+                if theme.get("mirek") is not None and light.get("supports_ct"):
+                    m_min = light.get("mirek_min", 153)
+                    m_max = light.get("mirek_max", 500)
+                    m = int(round(clamp(float(theme["mirek"]), float(m_min), float(m_max))))
+                    body["color_temperature"] = {"mirek": m}
+                elif light.get("supports_color"):
+                    xy = hex_to_xy(theme.get("hex"))
+                    if xy is not None:
+                        body["color"] = {"xy": {"x": xy[0], "y": xy[1]}}
+                eff = theme.get("effect") or "no_effect"
+                avail = light.get("available_effects") or []
+                if eff == "no_effect" or eff in avail:
+                    body["effects"] = {"effect": eff}
+            if body:
+                self.queue("light", light_id, body)
+        elif name == "schedule_mode":
+            mode = cmd.get("mode")
+            if mode not in SCHEDULE_MODES:
+                return
+            with self.lock:
+                def _set_mode(data):
+                    data["mode"] = mode
+                merged = update_local_schedules(_set_mode)
+                self.schedule_mode = merged["mode"]
+                self.local_schedules = merged["schedules"]
+                self._rebuild_schedules()
+            self.emit()
+        elif name == "schedule_create" and (self.config or self._has_extra_providers()):
+            source = cmd.get("source") if cmd.get("source") in SCHEDULE_MODES else self.schedule_mode
+            if not self.config or is_extra_resource(cmd.get("target_id")) or is_extra_resource(cmd.get("scene_id")):
+                source = "local"
+            if source == "local":
+                with self.lock:
+                    if not self.known_target(cmd.get("target_kind"), cmd.get("target_id")):
+                        self.error = "Schedule could not be saved (unknown target)."
+                        self.emit()
+                        return
+                    if cmd.get("action") == "scene" and not self.known("scene", cmd.get("scene_id")):
+                        self.error = "Schedule could not be saved (unknown scene)."
+                        self.emit()
+                        return
+                    if len(self.local_schedules) >= MAX_LOCAL_SCHEDULES:
+                        self.error = "Schedule limit reached."
+                        self.emit()
+                        return
+                    raw_sched = {
+                        "id": str(uuid.uuid4()),
+                        "name": cmd.get("name"),
+                        "enabled": cmd.get("enabled", True),
+                        "target_kind": cmd.get("target_kind"),
+                        "target_id": cmd.get("target_id"),
+                        "target_name": self._target_name(cmd.get("target_kind"), cmd.get("target_id")) or cmd.get("target_name", ""),
+                        "trigger_kind": "time",
+                        "time": cmd.get("time"),
+                        "offset_min": 0,
+                        "days": cmd.get("days", []),
+                        "action": cmd.get("action"),
+                        "bri": cmd.get("bri"),
+                        "scene_id": cmd.get("scene_id", ""),
+                        "fade_min": cmd.get("fade_min", 0),
+                        "source": "local",
+                    }
+                    sched = validate_local_schedule(raw_sched)
+                    if sched is None:
+                        self.error = "Schedule could not be saved (invalid settings)."
+                        self.emit()
+                        return
+                    def _add_sched(data):
+                        if len(data["schedules"]) >= MAX_LOCAL_SCHEDULES:
+                            return False
+                        data["schedules"].append(sched)
+                    merged = update_local_schedules(_add_sched)
+                    self.schedule_mode = merged["mode"]
+                    self.local_schedules = merged["schedules"]
+                    self._rebuild_schedules()
+                self.emit()
+                self.wake.set()
+            else:
+                with self.lock:
+                    if not self.known_target(cmd.get("target_kind"), cmd.get("target_id")):
+                        return
+                    if cmd.get("action") == "scene" and not self.known("scene", cmd.get("scene_id")):
+                        return
+                    payload = build_schedule_payload(cmd, getattr(self, "schedule_script_id", DEFAULT_SCHEDULE_SCRIPT_ID))
+                    if payload is None or len(self.api_queue) >= MAX_API_QUEUE:
+                        return
+                    self.api_queue.append(("POST", "/clip/v2/resource/behavior_instance", payload))
+                self.wake.set()
+        elif name == "schedule_toggle":
+            sid = cmd.get("id")
+            enabled = cmd.get("enabled")
+            if not valid_uuid(sid) or not isinstance(enabled, bool):
+                return
+            with self.lock:
+                local_target = next((s for s in self.local_schedules if s["id"] == sid), None)
+                if local_target is not None:
+                    def _toggle_sched(data):
+                        for s in data["schedules"]:
+                            if s["id"] == sid:
+                                s["enabled"] = enabled
+                                return True
+                        return False
+                    merged = update_local_schedules(_toggle_sched)
+                    self.schedule_mode = merged["mode"]
+                    self.local_schedules = merged["schedules"]
+                    self._rebuild_schedules()
+                    handled_local = True
+                else:
+                    handled_local = False
+                    if not self.config:
+                        return
+                    target = next((s for s in self.bridge_schedules if s["id"] == sid), None)
+                    if target is None or len(self.api_queue) >= MAX_API_QUEUE:
+                        return
+                    target["enabled"] = enabled
+                    self._rebuild_schedules()
+                    self.api_queue.append(("PUT", "/clip/v2/resource/behavior_instance/%s" % sid, {"enabled": enabled}))
+            self.emit()
+            if not handled_local or enabled:
+                self.wake.set()
+        elif name == "schedule_delete":
+            sid = cmd.get("id")
+            if not valid_uuid(sid):
+                return
+            with self.lock:
+                if any(s["id"] == sid for s in self.local_schedules):
+                    def _del_sched(data):
+                        before = len(data["schedules"])
+                        data["schedules"] = [s for s in data["schedules"] if s["id"] != sid]
+                        return len(data["schedules"]) != before
+                    merged = update_local_schedules(_del_sched)
+                    self.schedule_mode = merged["mode"]
+                    self.local_schedules = merged["schedules"]
+                    self._local_sched_fired.pop(sid, None)
+                    self._rebuild_schedules()
+                    handled_local = True
+                else:
+                    handled_local = False
+                    if not self.config:
+                        return
+                    if not any(s["id"] == sid for s in self.bridge_schedules) or len(self.api_queue) >= MAX_API_QUEUE:
+                        return
+                    self.bridge_schedules = [s for s in self.bridge_schedules if s["id"] != sid]
+                    self._rebuild_schedules()
+                    self.api_queue.append(("DELETE", "/clip/v2/resource/behavior_instance/%s" % sid, None))
+            self.emit()
+            if not handled_local:
+                self.wake.set()
+        elif name == "synth_config":
+            new_source = cmd.get("source") if isinstance(cmd, dict) else None
+            with self.lock:
+                need_stop = (
+                    new_source in SYNTH_SOURCES
+                    and new_source != self.synth.source
+                    and (self.synth.running or self.synth._thread is not None)
+                )
+            if need_stop:
+                self.synth.stop(emit=False)
+            with self.lock:
+                changed = self.synth.configure(cmd)
+            if changed or need_stop:
+                self.emit()
+        elif name == "synth_start" and self.config:
+            self.synth.start()
+        elif name == "synth_stop":
+            self.synth.stop(emit=True)
+        elif name == "synth_toggle":
+            if self.synth.running:
+                self.synth.stop(emit=True)
+            elif self.config:
+                self.synth.start()
+        elif name == "rule_save":
+            rule = validate_rule(cmd.get("rule"))
+            if rule is None:
+                with self.lock:
+                    self.error = "Rule could not be saved (invalid trigger or target)."
+                self.emit()
+                return
+            with self.lock:
+                candidate = [r for r in self.rules if r["id"] != rule["id"]]
+                if len(candidate) >= MAX_RULES:
+                    return
+                candidate.append(rule)
+                cycle_err = detect_rule_cycles(candidate)
+                if cycle_err:
+                    self.set_error("errRuleCycle", "Rule rejected (%s)", cycle_err)
+                    rejected = True
+                else:
+                    rejected = False
+                    save_rules({"paused": self.rules_paused, "rules": candidate})
+                    self.rules = candidate
+                    if self.error_code == "errRuleCycle":
+                        self.error, self.error_code, self.error_args = "", "", []
+            self.emit()
+        elif name == "rule_delete":
+            rid = cmd.get("id")
+            if not valid_uuid(rid):
+                return
+            with self.lock:
+                new_rules = [r for r in self.rules if r["id"] != rid]
+                if len(new_rules) == len(self.rules):
+                    return
+                save_rules({"paused": self.rules_paused, "rules": new_rules})
+                self.rules = new_rules
+                self.rule_last_fired.pop(rid, None)
+            self.emit()
+        elif name == "rule_toggle":
+            rid = cmd.get("id")
+            enabled = cmd.get("enabled")
+            if not valid_uuid(rid) or not isinstance(enabled, bool):
+                return
+            with self.lock:
+                if not any(r["id"] == rid for r in self.rules):
+                    return
+                candidate = [dict(r, enabled=enabled) if r["id"] == rid else r for r in self.rules]
+                if enabled:
+                    cycle_err = detect_rule_cycles(candidate)
+                    if cycle_err:
+                        self.set_error("errRuleCycle", "Rule rejected (%s)", cycle_err)
+                        self.emit()
+                        return
+                save_rules({"paused": self.rules_paused, "rules": candidate})
+                self.rules = candidate
+                if self.error_code == "errRuleCycle":
+                    self.error, self.error_code, self.error_args = "", "", []
+            self.emit()
+        elif name == "rules_pause":
+            paused = cmd.get("paused")
+            if not isinstance(paused, bool):
+                return
+            with self.lock:
+                save_rules({"paused": paused, "rules": self.rules})
+                self.rules_paused = paused
+            self.emit()
+        elif name == "desktop_event" and self.config:
+            event = cmd.get("event")
+            if event not in ("wake", "sleep"):
+                return
+            with self.lock:
+                fired = self.evaluate_rules([("desktop", event, {}, {"event": event})])
+            if fired:
+                self.emit()
+                self.wake.set()
+        elif name == "floorplan_save":
+            fp = validate_floorplan(cmd.get("floorplan"))
+            if fp is None:
+                return
+            with self.lock:
+                if not fp.get("bridge_id") and self.config.get("bridge_id"):
+                    fp["bridge_id"] = self.config["bridge_id"]
+                fp = save_floorplan(fp)
+                self.floorplan = fp
+            self.emit()
+        elif name == "floorplan_template":
+            tid = cmd.get("template_id")
+            if tid not in FLOORPLAN_TEMPLATES:
+                return
+            include_plan = bool(cmd.get("include_plan", False))
+            with self.lock:
+                bid = self.config.get("bridge_id", "") if self.config else ""
+                fp = build_floorplan_template(tid, self._all_rooms(), bridge_id=bid, include_plan=include_plan)
+                if fp is None:
+                    return
+                fp = save_floorplan(fp)
+                self.floorplan = fp
+            self.emit()
+        elif name == "floorplan_bg_set":
+            src = cmd.get("path") if "path" in cmd else cmd.get("source_path")
+            raw_opacity = cmd.get("opacity")
+            raw_fit = cmd.get("fit")
+            opacity = None
+            if raw_opacity is not None:
+                opacity = _strict_finite(raw_opacity, 0.05, 1.0)
+                if opacity is None:
+                    return
+            if raw_fit is not None and raw_fit not in FLOORPLAN_BG_FITS:
+                return
+            try:
+                dest_path = set_floorplan_background(src)
+            except (OSError, ValueError):
+                return
+            with self.lock:
+                fp = dict(self._ensure_floorplan())
+                bg = dict(fp.get("background") or {"path": "", "opacity": 0.35, "fit": "contain"})
+                bg["path"] = dest_path
+                if opacity is not None:
+                    bg["opacity"] = round(opacity, 3)
+                if raw_fit is not None:
+                    bg["fit"] = raw_fit
+                fp["background"] = bg
+                fp = save_floorplan(fp)
+                self.floorplan = fp
+            self.emit()
+        elif name == "floorplan_bg_update":
+            has_op = "opacity" in cmd and cmd["opacity"] is not None
+            has_fit = "fit" in cmd and cmd["fit"] is not None
+            if not has_op and not has_fit:
+                return
+            opacity = None
+            if has_op:
+                opacity = _strict_finite(cmd["opacity"], 0.05, 1.0)
+                if opacity is None:
+                    return
+            fit = cmd.get("fit") if has_fit else None
+            if has_fit and fit not in FLOORPLAN_BG_FITS:
+                return
+            with self.lock:
+                fp = dict(self._ensure_floorplan())
+                bg = dict(fp.get("background") or {"path": "", "opacity": 0.35, "fit": "contain"})
+                if opacity is not None:
+                    bg["opacity"] = round(opacity, 3)
+                if fit is not None:
+                    bg["fit"] = fit
+                fp["background"] = bg
+                fp = save_floorplan(fp)
+                self.floorplan = fp
+            self.emit()
+        elif name == "floorplan_bg_clear":
+            with self.lock:
+                clear_floorplan_background()
+                fp = dict(self._ensure_floorplan())
+                bg = dict(fp.get("background") or {"path": "", "opacity": 0.35, "fit": "contain"})
+                bg["path"] = ""
+                fp["background"] = bg
+                fp = save_floorplan(fp)
+                self.floorplan = fp
+            self.emit()
+        elif name == "light_rename" and self.config:
+            lid = cmd.get("id")
+            raw_name = cmd.get("name")
+            if not valid_uuid(lid) or not isinstance(raw_name, str):
+                return
+            new_name = clean(raw_name, 32)
+            if not new_name:
+                return
+            with self.lock:
+                if not self.known("light", lid):
+                    return
+                light = self._find_light(lid)
+                dev_id = light.get("device_id", "") if light else ""
+                needed = 2 if valid_uuid(dev_id) else 1
+                if len(self.api_queue) + needed > MAX_API_QUEUE:
+                    return
+                self.api_queue.append(("PUT", "/clip/v2/resource/light/%s" % lid, {"metadata": {"name": new_name}}))
+                if valid_uuid(dev_id):
+                    self.api_queue.append(("PUT", "/clip/v2/resource/device/%s" % dev_id, {"metadata": {"name": new_name}}))
+                for room in self.rooms:
+                    for item in room["lights"]:
+                        if item["id"] == lid:
+                            item["name"] = new_name
+            self.emit()
+            self.wake.set()
+        elif name == "room_create" and self.config:
+            kind = cmd.get("kind")
+            raw_name = cmd.get("name")
+            if kind not in ("room", "zone") or not isinstance(raw_name, str):
+                return
+            new_name = clean(raw_name, 32)
+            if not new_name:
+                return
+            arch = cmd.get("archetype", "other")
+            if arch is None or arch == "":
+                arch = "other"
+            if not isinstance(arch, str) or arch not in HUE_ARCHETYPES:
+                return
+            raw_ids = cmd.get("device_ids" if kind == "room" else "light_ids", [])
+            if raw_ids is None:
+                raw_ids = []
+            if not isinstance(raw_ids, list) or len(raw_ids) > MAX_GROUP_LIGHTS:
+                return
+            child_ids = []
+            seen_c = set()
+            for cid in raw_ids:
+                if not valid_uuid(cid):
+                    return
+                if cid not in seen_c:
+                    seen_c.add(cid)
+                    child_ids.append(cid)
+            child_rtype = "device" if kind == "room" else "light"
+            payload = {
+                "metadata": {"name": new_name, "archetype": arch},
+                "children": [{"rid": cid, "rtype": child_rtype} for cid in child_ids],
+            }
+            with self.lock:
+                if len(self.api_queue) >= MAX_API_QUEUE:
+                    return
+                self.api_queue.append(("POST", "/clip/v2/resource/%s" % kind, payload))
+            self.wake.set()
+        elif name == "room_update" and self.config:
+            rid = cmd.get("id")
+            kind = cmd.get("kind")
+            if not valid_uuid(rid) or kind not in ("room", "zone"):
+                return
+            payload = {}
+            metadata = {}
+            if "name" in cmd and cmd["name"] is not None:
+                if not isinstance(cmd["name"], str):
+                    return
+                new_name = clean(cmd["name"], 32)
+                if not new_name:
+                    return
+                metadata["name"] = new_name
+            if "archetype" in cmd and cmd["archetype"] is not None:
+                arch = cmd["archetype"]
+                if not isinstance(arch, str) or arch not in HUE_ARCHETYPES:
+                    return
+                metadata["archetype"] = arch
+            if metadata:
+                payload["metadata"] = metadata
+            if "children" in cmd and cmd["children"] is not None:
+                raw_children = cmd["children"]
+                if not isinstance(raw_children, list) or len(raw_children) > MAX_GROUP_LIGHTS:
+                    return
+                child_ids = []
+                seen_c = set()
+                for cid in raw_children:
+                    if not valid_uuid(cid):
+                        return
+                    if cid not in seen_c:
+                        seen_c.add(cid)
+                        child_ids.append(cid)
+                child_rtype = "device" if kind == "room" else "light"
+                payload["children"] = [{"rid": cid, "rtype": child_rtype} for cid in child_ids]
+            if not payload:
+                return
+            with self.lock:
+                if not self.known_target(kind, rid) or len(self.api_queue) >= MAX_API_QUEUE:
+                    return
+                self.api_queue.append(("PUT", "/clip/v2/resource/%s/%s" % (kind, rid), payload))
+                for room in self.rooms:
+                    if room["kind"] == kind and room["id"] == rid:
+                        if "name" in metadata:
+                            room["name"] = metadata["name"]
+                        if "archetype" in metadata:
+                            room["archetype"] = metadata["archetype"]
+                        break
+            self.emit()
+            self.wake.set()
+        elif name == "room_delete" and self.config:
+            rid = cmd.get("id")
+            kind = cmd.get("kind")
+            if not valid_uuid(rid) or kind not in ("room", "zone"):
+                return
+            with self.lock:
+                if not self.known_target(kind, rid) or len(self.api_queue) >= MAX_API_QUEUE:
+                    return
+                self.api_queue.append(("DELETE", "/clip/v2/resource/%s/%s" % (kind, rid), None))
+            self.wake.set()
+        elif name == "scene_create" and self.config:
+            room_id = cmd.get("room_id")
+            raw_name = cmd.get("name")
+            if not valid_uuid(room_id) or not isinstance(raw_name, str):
+                return
+            scene_name = clean(raw_name, 32)
+            if not scene_name:
+                return
+            with self.lock:
+                target_room = next(
+                    (r for r in self.rooms if r["kind"] in ("room", "zone") and r["id"] == room_id),
+                    None,
+                )
+                if target_room is None or not target_room.get("lights") or len(self.api_queue) >= MAX_API_QUEUE:
+                    return
+                actions = []
+                for light in target_room["lights"]:
+                    lid = light.get("id")
+                    if not valid_uuid(lid):
+                        continue
+                    is_on = bool(light.get("on", False))
+                    act = {"on": {"on": is_on}}
+                    if is_on:
+                        if light.get("dimmable", True):
+                            act["dimming"] = {"brightness": round(clamp(float(light.get("bri", 100.0)), 1.0, 100.0), 1)}
+                        if light.get("mirek") is not None and light.get("supports_ct"):
+                            m_min = light.get("mirek_min", 153)
+                            m_max = light.get("mirek_max", 500)
+                            act["color_temperature"] = {
+                                "mirek": int(round(clamp(float(light["mirek"]), float(m_min), float(m_max))))
+                            }
+                        elif light.get("supports_color"):
+                            xy = hex_to_xy(light.get("color"))
+                            if xy is not None:
+                                act["color"] = {"xy": {"x": xy[0], "y": xy[1]}}
+                    actions.append({
+                        "target": {"rid": lid, "rtype": "light"},
+                        "action": act,
+                    })
+                if not actions:
+                    return
+                payload = {
+                    "metadata": {"name": scene_name},
+                    "group": {"rid": room_id, "rtype": target_room["kind"]},
+                    "actions": actions,
+                }
+                self.api_queue.append(("POST", "/clip/v2/resource/scene", payload))
+            self.wake.set()
+        elif name == "floorplan_sync_rooms" and self.config:
+            queued = False
+            with self.lock:
+                if not self.floorplan:
+                    return
+                diffs = compute_room_membership_diffs(self.floorplan, self.rooms)
+                known_rooms = {r["id"]: r for r in self.rooms if r.get("kind") == "room" and valid_uuid(r.get("id"))}
+                room_devices = {}
+                for rid, r in known_rooms.items():
+                    devs = []
+                    seen_d = set()
+                    for l in r.get("lights") or []:
+                        did = l.get("device_id")
+                        if valid_uuid(did) and did not in seen_d:
+                            seen_d.add(did)
+                            devs.append(did)
+                    room_devices[rid] = devs
+                removals = {}
+                additions = {}
+                moved = set()
+                for d in diffs:
+                    did = d.get("device_id")
+                    from_rid = d.get("from_room_id") or ""
+                    to_rid = d.get("to_room_id") or ""
+                    if not valid_uuid(did) or did in moved or not valid_uuid(to_rid) or to_rid not in known_rooms:
+                        continue
+                    if from_rid == to_rid:
+                        continue
+                    moved.add(did)
+                    if valid_uuid(from_rid) and from_rid in known_rooms:
+                        removals.setdefault(from_rid, set()).add(did)
+                    additions.setdefault(to_rid, []).append(did)
+                calls = []
+                self._sync_batch_seq += 1
+                batch_id = self._sync_batch_seq
+                orig_room_devices = {rid: list(devs) for rid, devs in room_devices.items()}
+                # Phase A: Remove moved devices from old rooms FIRST (Hue 1-room-per-device rule)
+                for rid in sorted(removals):
+                    kept = [d for d in room_devices[rid] if d not in removals[rid]]
+                    room_devices[rid] = kept
+                    rollback_body = {"children": [{"rid": d, "rtype": "device"} for d in orig_room_devices[rid]]}
+                    calls.append((
+                        "PUT",
+                        "/clip/v2/resource/room/%s" % rid,
+                        {"children": [{"rid": d, "rtype": "device"} for d in kept]},
+                        {"batch_id": batch_id, "rollback": ("PUT", "/clip/v2/resource/room/%s" % rid, rollback_body)},
+                    ))
+                # Phase B: Add moved devices to new rooms SECOND
+                for rid in sorted(additions):
+                    updated = list(room_devices[rid])
+                    for d in additions[rid]:
+                        if d not in updated:
+                            updated.append(d)
+                    room_devices[rid] = updated
+                    calls.append((
+                        "PUT",
+                        "/clip/v2/resource/room/%s" % rid,
+                        {"children": [{"rid": d, "rtype": "device"} for d in updated]},
+                        {"batch_id": batch_id},
+                    ))
+                if calls and len(self.api_queue) + len(calls) <= MAX_API_QUEUE:
+                    self.api_queue.extend(calls)
+                    queued = True
+            if queued:
+                self.wake.set()
+        elif name == "floorplan_sync_all" and self.config:
+            queued = False
+            meta_updated = False
+            with self.lock:
+                if not self.floorplan:
+                    return
+                pending_box_ids = {
+                    q[3]["link_box_id"]
+                    for q in self.api_queue
+                    if len(q) == 4 and isinstance(q[3], dict) and q[3].get("link_box_id")
+                }
+                raw_calls = build_floorplan_sync_calls(
+                    self.floorplan,
+                    self.rooms,
+                    getattr(self, "entertainment_areas", []),
+                    getattr(self, "_light_to_ent_service", {}),
+                    include_meta=True,
+                    pending_box_ids=pending_box_ids,
+                )
+                self._sync_batch_seq += 1
+                batch_id = self._sync_batch_seq
+                calls = []
+                for m, p, b, meta in raw_calls:
+                    mcopy = dict(meta)
+                    mcopy["batch_id"] = batch_id
+                    calls.append((m, p, b, mcopy))
+                if calls and len(self.api_queue) + len(calls) <= MAX_API_QUEUE:
+                    self.api_queue.extend(calls)
+                    queued = True
+                    # Optimistically apply room/zone name & archetype updates locally
+                    for box in self.floorplan.get("boxes") or []:
+                        hid = box.get("hue_id")
+                        if not valid_uuid(hid):
+                            continue
+                        for room in self.rooms:
+                            if room["kind"] == box["kind"] and room["id"] == hid:
+                                bname = clean(box.get("name") or "", 32)
+                                if bname and room["name"] != bname:
+                                    room["name"] = bname
+                                    meta_updated = True
+                                barch = box.get("archetype")
+                                if barch in HUE_ARCHETYPES and room.get("archetype") != barch:
+                                    room["archetype"] = barch
+                                    meta_updated = True
+            if meta_updated:
+                self.emit()
+            if queued:
+                self.wake.set()
+        elif name == "entertainment_sync" and self.config:
+            area_id = cmd.get("area_id")
+            box_id = cmd.get("box_id")
+            if not valid_uuid(area_id) or not isinstance(box_id, str) or FLOORPLAN_ID_RE.match(box_id) is None:
+                return
+            queued = False
+            with self.lock:
+                if not self.floorplan or len(self.api_queue) >= MAX_API_QUEUE:
+                    return
+                area = next((a for a in getattr(self, "entertainment_areas", []) if a["id"] == area_id), None)
+                box = next((b for b in (self.floorplan.get("boxes") or []) if b["id"] == box_id), None)
+                if area is None or box is None:
+                    return
+                positions = compute_entertainment_positions(box, self.floorplan, self.rooms)
+                svc_locs = _build_entertainment_service_locations(
+                    area, positions, getattr(self, "_light_to_ent_service", {})
+                )
+                if not svc_locs:
+                    return
+                self.api_queue.append((
+                    "PUT",
+                    "/clip/v2/resource/entertainment_configuration/%s" % area_id,
+                    {"locations": {"service_locations": svc_locs}},
+                ))
+                queued = True
+            if queued:
+                self.wake.set()
+        elif name == "sensor_toggle" and self.config:
+            kind = cmd.get("kind")
+            rid = cmd.get("id")
+            enabled = cmd.get("enabled")
+            if kind not in ("motion", "contact") or not valid_uuid(rid) or not isinstance(enabled, bool):
+                return
+            with self.lock:
+                sensor = next(
+                    (s for s in getattr(self, "sensors", []) if s.get("kind") == kind and s.get("id") == rid),
+                    None,
+                )
+                if sensor is None or len(self.api_queue) >= MAX_API_QUEUE:
+                    return
+                self.api_queue.append(("PUT", "/clip/v2/resource/%s/%s" % (kind, rid), {"enabled": enabled}))
+                sensor["enabled"] = enabled
+            self.emit()
+            self.wake.set()
+        elif name == "motion_area_update" and self.config:
+            rid = cmd.get("id")
+            if not valid_uuid(rid):
+                return
+            has_enabled = "enabled" in cmd and cmd["enabled"] is not None
+            has_sens = "sensitivity" in cmd and cmd["sensitivity"] is not None
+            if not has_enabled and not has_sens:
+                return
+            if has_enabled and not isinstance(cmd["enabled"], bool):
+                return
+            if has_sens and (isinstance(cmd["sensitivity"], bool) or not isinstance(cmd["sensitivity"], int)):
+                return
+            with self.lock:
+                area = next(
+                    (a for a in getattr(self, "motion_areas", []) if a.get("id") == rid),
+                    None,
+                )
+                if area is None:
+                    return
+                calls = []
+                if has_enabled:
+                    calls.append((
+                        "PUT",
+                        "/clip/v2/resource/motion_area_configuration/%s" % rid,
+                        {"enabled": cmd["enabled"]},
+                    ))
+                apply_sens = False
+                if has_sens:
+                    smax = area.get("sensitivity_max", 4)
+                    if not (0 <= cmd["sensitivity"] <= smax):
+                        return
+                    conv_id = area.get("convenience_id", "")
+                    if valid_uuid(conv_id):
+                        calls.append((
+                            "PUT",
+                            "/clip/v2/resource/convenience_area_motion/%s" % conv_id,
+                            {"sensitivity": {"sensitivity": cmd["sensitivity"]}},
+                        ))
+                        apply_sens = True
+                if not calls or len(self.api_queue) + len(calls) > MAX_API_QUEUE:
+                    return
+                self.api_queue.extend(calls)
+                if has_enabled:
+                    area["enabled"] = cmd["enabled"]
+                    annotate_motion_aware_lights(self.rooms, self.motion_areas)
+                if apply_sens:
+                    area["sensitivity"] = cmd["sensitivity"]
+            self.emit()
+            self.wake.set()
+        elif name == "ai_clear":
+            with self.lock:
+                self._ai_seq = getattr(self, "_ai_seq", 0) + 1
+                self.ai_state = {
+                    "busy": False,
+                    "last_prompt": "",
+                    "last_reply": "",
+                    "last_actions": [],
+                    "engine": "",
+                    "error": "",
+                }
+            self.emit()
+        elif name == "ai_ask":
+            raw_prompt = cmd.get("prompt")
+            if not isinstance(raw_prompt, str):
+                raw_prompt = ""
+            prompt_exec = "".join(ch for ch in raw_prompt if ch.isprintable()).strip()[:500]
+            prompt_safe = clean(raw_prompt, 240)
+            if not prompt_exec:
+                with self.lock:
+                    self._ai_seq = getattr(self, "_ai_seq", 0) + 1
+                    self.ai_state = {
+                        "busy": False,
+                        "last_prompt": "",
+                        "last_reply": "",
+                        "last_actions": [],
+                        "engine": "builtin",
+                        "error": "Please enter a command.",
+                    }
+                self.emit()
+                return
+            raw_ollama_url = cmd.get("ollama_url")
+            ollama_url = raw_ollama_url.strip()[:200] if isinstance(raw_ollama_url, str) and raw_ollama_url.strip() else None
+            raw_ollama_model = cmd.get("ollama_model")
+            ollama_model = clean(raw_ollama_model, 100) if isinstance(raw_ollama_model, str) else ""
+            with self.lock:
+                if getattr(self, "ai_state", {}).get("busy"):
+                    return
+                self._ai_seq = getattr(self, "_ai_seq", 0) + 1
+                seq = self._ai_seq
+                self.ai_state = {
+                    "busy": True,
+                    "last_prompt": prompt_safe,
+                    "last_reply": "",
+                    "last_actions": [],
+                    "engine": "",
+                    "error": "",
+                }
+            self.emit()
+
+            def _run_ai():
+                try:
+                    ai_mod = _load_ai_module()
+                    kwargs = {}
+                    if ollama_url is not None:
+                        kwargs["ollama_url"] = ollama_url
+                    if ollama_model:
+                        kwargs["ollama_model"] = ollama_model
+                    res = ai_mod.execute_ask_ai(self, prompt_exec, **kwargs)
+                    ok = bool(res.get("ok"))
+                    reply = clean(self.redact(res.get("reply") or ""), 400)
+                    actions = [clean(self.redact(a), 120) for a in (res.get("actions") or [])][:32]
+                    engine = clean(str(res.get("engine") or ""), 32)
+                    with self.lock:
+                        if seq != getattr(self, "_ai_seq", 0):
+                            return
+                        self.ai_state = {
+                            "busy": False,
+                            "last_prompt": prompt_safe,
+                            "last_reply": reply if ok else "",
+                            "last_actions": actions,
+                            "engine": engine,
+                            "error": "" if ok else (reply or "Could not understand command."),
+                        }
+                except Exception as exc:  # noqa: BLE001
+                    with self.lock:
+                        if seq != getattr(self, "_ai_seq", 0):
+                            return
+                        self.ai_state = {
+                            "busy": False,
+                            "last_prompt": prompt_safe,
+                            "last_reply": "",
+                            "last_actions": [],
+                            "engine": "",
+                            "error": self.safe(exc, 160),
+                        }
+                self.emit()
+
+            threading.Thread(target=_run_ai, daemon=True).start()
+        elif name == "save_provider" and self.providers_mgr:
+            raw_prov = cmd.get("provider")
+            try:
+                self.providers_mgr.save_connection(raw_prov)
+                self.providers_mgr.last_action = {"running": False, "kind": "save", "ok": True, "message": "Saved", "pair_id": ""}
+            except Exception as exc:  # noqa: BLE001
+                self.providers_mgr.last_action = {"running": False, "kind": "save", "ok": False, "message": self.redact(str(exc))[:160], "pair_id": ""}
+                self.emit()
+                return
+            self.emit()
+        elif name == "remove_provider" and self.providers_mgr:
+            cid = str(cmd.get("id") or "")
+            if cid:
+                try:
+                    self.providers_mgr.remove_connection(cid)
+                except Exception:
+                    pass
+                self.emit()
+        elif name == "toggle_provider" and self.providers_mgr:
+            cid = str(cmd.get("id") or "")
+            enabled = bool(cmd.get("enabled", True))
+            if cid:
+                try:
+                    self.providers_mgr.toggle_connection(cid, enabled)
+                except Exception:
+                    pass
+                self.emit()
+        elif name == "trust_provider_cert" and self.providers_mgr:
+            cid = str(cmd.get("id") or "")
+            if cid:
+                try:
+                    self.providers_mgr.trust_new_certificate(cid)
+                    self.providers_mgr.last_action = {"running": False, "kind": "trust_cert", "ok": True, "message": "Certificate trusted — reconnecting", "pair_id": ""}
+                except Exception as exc:  # noqa: BLE001
+                    self.providers_mgr.last_action = {"running": False, "kind": "trust_cert", "ok": False, "message": self.redact(str(exc))[:160], "pair_id": ""}
+                self.emit()
+        elif name == "clear_provider_action" and self.providers_mgr:
+            self.providers_mgr.last_action = {"running": False, "kind": "", "ok": False, "message": "", "pair_id": ""}
+            self.emit()
+        elif name == "discover_providers" and self.providers_mgr and self._providers_mod:
+            if not self.providers_mgr.discovering:
+                self.providers_mgr.discovering = True
+                self.emit()
+                def _disc_providers():
+                    try:
+                        found = self._providers_mod.discover_providers(run_bounded=run_bounded)
+                    except Exception:
+                        found = []
+                    self.providers_mgr.discovered = found
+                    self.providers_mgr.discovering = False
+                    self.emit()
+                threading.Thread(target=_disc_providers, daemon=True).start()
+        elif name == "test_provider" and self.providers_mgr:
+            raw_prov = cmd.get("provider")
+            self.providers_mgr.last_action = {"running": True, "kind": "test", "ok": False, "message": "", "pair_id": ""}
+            self.emit()
+            def _test_prov():
+                try:
+                    summary = self.providers_mgr.test_connection(raw_prov)
+                    self.providers_mgr.last_action = {"running": False, "kind": "test", "ok": True, "message": self.redact(summary)[:160], "pair_id": ""}
+                except Exception as exc:  # noqa: BLE001
+                    self.providers_mgr.last_action = {"running": False, "kind": "test", "ok": False, "message": self.redact(str(exc))[:160], "pair_id": ""}
+                self.emit()
+            threading.Thread(target=_test_prov, daemon=True).start()
+        elif name == "pair_provider" and self.providers_mgr and self._providers_mod:
+            pkind = str(cmd.get("kind") or "").lower()
+            phost = str(cmd.get("host") or "").strip()
+            pport = cmd.get("port")
+            if pkind not in ("nanoleaf", "dirigera"):
+                return
+            eff_port = int(pport or (16021 if pkind == "nanoleaf" else 8443))
+            self.providers_mgr.last_action = {"running": True, "kind": f"pair_{pkind}", "ok": False, "message": "", "pair_id": ""}
+            self.emit()
+            def _pair_prov():
+                try:
+                    if pkind == "nanoleaf":
+                        tok, fp = self._providers_mod.pair_nanoleaf(phost, eff_port)
+                    else:
+                        tok, fp = self._providers_mod.pair_dirigera(phost, eff_port)
+                    # Never emit the raw token in snapshots — keep it server-side under a one-time pair_id!
+                    pair_id = self.providers_mgr.store_paired_token(pkind, phost, eff_port, tok, fp)
+                    self.providers_mgr.last_action = {"running": False, "kind": f"pair_{pkind}", "ok": True, "message": "Paired", "pair_id": pair_id}
+                except Exception as exc:  # noqa: BLE001
+                    self.providers_mgr.last_action = {"running": False, "kind": f"pair_{pkind}", "ok": False, "message": self.redact(str(exc))[:160], "pair_id": ""}
+                self.emit()
+            threading.Thread(target=_pair_prov, daemon=True).start()
+
+    # -- loops
+    def worker(self):
+        """One round at a time. Whatever goes wrong in a round (a bridge reply of a shape
+        nobody expected) is shown as an error and the next round runs: the thread never dies
+        while the helper process stays up, which the extension could not notice."""
+        while True:
+            with self.lock:
+                generations = (self.pair_generation, self.conn_generation)
+            try:
+                self.work_once()
+            except Exception as exc:   # noqa: BLE001 - the loop must survive anything
+                with self.lock:
+                    # Not after Unpair, Cancel or a new Pair: the failure belonged to the old state.
+                    if generations == (self.pair_generation, self.conn_generation):
+                        self.set_error("errInternal", "Something went wrong (%s)", self.safe(exc, 60))
+                try:
+                    self.emit()
+                except OSError:
+                    return
+                time.sleep(2.0)
+
+    def work_once(self):
+        if self.pair_ip:
+            with self.lock:
+                expired = bool(self.pair_ip) and time.time() > self.pair_until   # a new Pair may have just started
+                if expired:
+                    self.pair_ip = ""
+                    self.phase = "connecting" if self.config else "unpaired"
+                    self.set_error("errNoPress", "No button press seen. Press the round button on the bridge, then try again.")
+            if not expired:
+                self.try_pair()
+            self.emit()
+            if self.pair_ip:
+                self.wake.wait(2.0)
+                self.wake.clear()
+            return
+        if self.config or self._has_extra_providers():
+            self.check_local_schedules()
+        if self.send_api_queue():
+            self.emit()
+            return
+        if self.send_pending():
+            with self.lock:
+                has_more = bool(self.pending)
+            if not has_more:
+                # Let the bridge settle, then show the real state.
+                self.last_refresh = time.time() - (POLL_OPEN if self.panel_open else POLL_CLOSED) + 1.2
+            return
+        with self.lock:
+            has_more = bool(self.pending) or bool(self.api_queue)
+        if has_more:
+            time.sleep(0.05)
+            return
+        interval = POLL_OPEN if self.panel_open else POLL_CLOSED
+        if self.config and time.time() - self.last_refresh >= interval:
+            self.refresh()
+            self.emit()
+        elif not self.config and not self.candidates and not self.discovering and self.panel_open:
+            self.discover()
+        with self.lock:
+            has_local_sched = any(s.get("enabled") for s in self.local_schedules)
+        wait = max(0.05, interval - (time.time() - self.last_refresh)) if self.config else 5.0
+        if self.config and has_local_sched:
+            wait = min(wait, LOCAL_SCHEDULE_POLL_CAP)
+        self.wake.wait(wait)
+        self.wake.clear()
+
+    def run(self):
+        self.emit()
+        threading.Thread(target=self.worker, daemon=True).start()
+        threading.Thread(target=self.sse_loop, daemon=True).start()
+        if getattr(self, "providers_mgr", None):
+            self.providers_mgr.start_worker(on_change=self.emit, is_panel_open_fn=lambda: self.panel_open)
+        try:
+            for cmd in read_commands(sys.stdin.buffer):
+                try:
+                    self.handle(cmd)
+                except Exception as exc:   # noqa: BLE001 - one bad command must not end the helper
+                    with self.lock:
+                        self.set_error("errInternal", "Something went wrong (%s)", self.safe(exc, 60))
+                    self.emit()
+        finally:
+            self._stop.set()
+            if getattr(self, "providers_mgr", None):
+                self.providers_mgr.stop_worker()
+            if hasattr(self, "synth"):
+                self.synth.stop(emit=False)
+            self._reset_sse()
+
+
+def _terminate(signum, _frame):
+    sys.exit(128 + signum)   # unwinds the main thread; atexit then ends the children
+
+
+def main():
+    atexit.register(kill_children)
+    signal.signal(signal.SIGTERM, _terminate)
+    if "--once" in sys.argv:
+        hue = Hue()
+        hue.refresh()
+        print(json.dumps(hue.snapshot(), indent=1))
+        return
+    if len(sys.argv) >= 2 and sys.argv[1] in ("floorplan_bg_set", "floorplan_bg_update", "floorplan_bg_clear"):
+        sub = sys.argv[1]
+        hue = Hue()
+        if sub == "floorplan_bg_set":
+            if len(sys.argv) < 3:
+                sys.stderr.write("usage: hue-lights.py floorplan_bg_set <source_path> [opacity] [fit]\n")
+                sys.exit(2)
+            src = sys.argv[2]
+            opacity = None
+            if len(sys.argv) >= 4:
+                try:
+                    opacity = _strict_finite(float(sys.argv[3]), 0.05, 1.0)
+                except ValueError:
+                    opacity = None
+                if opacity is None:
+                    sys.stderr.write("invalid opacity\n")
+                    sys.exit(2)
+            fit = sys.argv[4] if len(sys.argv) >= 5 else None
+            if fit is not None and fit not in FLOORPLAN_BG_FITS:
+                sys.stderr.write("invalid fit\n")
+                sys.exit(2)
+            try:
+                dest_path = set_floorplan_background(src)
+            except (OSError, ValueError) as exc:
+                sys.stderr.write("%s\n" % clean(str(exc), 120))
+                sys.exit(1)
+            with hue.lock:
+                fp = dict(hue._ensure_floorplan())
+                bg = dict(fp.get("background") or {"path": "", "opacity": 0.35, "fit": "contain"})
+                bg["path"] = dest_path
+                if opacity is not None:
+                    bg["opacity"] = round(opacity, 3)
+                if fit is not None:
+                    bg["fit"] = fit
+                fp["background"] = bg
+                hue.floorplan = save_floorplan(fp)
+            print(json.dumps(hue.floorplan, indent=1))
+            return
+        if sub == "floorplan_bg_update":
+            if len(sys.argv) < 4:
+                sys.stderr.write("usage: hue-lights.py floorplan_bg_update <opacity> <fit>\n")
+                sys.exit(2)
+            try:
+                opacity = _strict_finite(float(sys.argv[2]), 0.05, 1.0)
+            except ValueError:
+                opacity = None
+            fit = sys.argv[3]
+            if opacity is None or fit not in FLOORPLAN_BG_FITS:
+                sys.stderr.write("invalid opacity or fit\n")
+                sys.exit(2)
+            with hue.lock:
+                fp = dict(hue._ensure_floorplan())
+                bg = dict(fp.get("background") or {"path": "", "opacity": 0.35, "fit": "contain"})
+                bg["opacity"] = round(opacity, 3)
+                bg["fit"] = fit
+                fp["background"] = bg
+                hue.floorplan = save_floorplan(fp)
+            print(json.dumps(hue.floorplan, indent=1))
+            return
+        if sub == "floorplan_bg_clear":
+            with hue.lock:
+                clear_floorplan_background()
+                fp = dict(hue._ensure_floorplan())
+                bg = dict(fp.get("background") or {"path": "", "opacity": 0.35, "fit": "contain"})
+                bg["path"] = ""
+                fp["background"] = bg
+                hue.floorplan = save_floorplan(fp)
+            print(json.dumps(hue.floorplan, indent=1))
+            return
+    try:
+        Hue().run()
+    except (KeyboardInterrupt, BrokenPipeError):
+        pass
+
+
+if __name__ == "__main__":
+    main()
