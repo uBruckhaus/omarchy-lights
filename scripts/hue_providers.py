@@ -233,8 +233,16 @@ def is_extra_resource(rid):
     return provider_prefix(rid) != "hue"
 
 
+# Home LAN ranges only: RFC 1918 plus IPv4 link-local. ipaddress.is_private also covers
+# 0/8, 100.64/10 (CGNAT), 192.0.0/24, 198.18/15 (benchmarking) and documentation ranges.
+LAN_NETWORKS = tuple(ipaddress.ip_network(n) for n in (
+    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16",
+))
+LOOPBACK_NETWORK = ipaddress.ip_network("127.0.0.0/8")
+
+
 def _is_allowed_ipv4(ip_str, allow_loopback=False):
-    if ip_str == METADATA_IP:
+    if not isinstance(ip_str, str) or ip_str == METADATA_IP:
         return False
     try:
         ip = ipaddress.ip_address(ip_str)
@@ -242,9 +250,11 @@ def _is_allowed_ipv4(ip_str, allow_loopback=False):
         return False
     if ip.version != 4:
         return False
-    if ip.is_loopback:
+    if ip in LOOPBACK_NETWORK:
         return bool(allow_loopback)
-    return (ip.is_private or ip.is_link_local) and not ip.is_multicast and not ip.is_unspecified
+    if ip == ipaddress.ip_address(METADATA_IP):
+        return False
+    return any(ip in net for net in LAN_NETWORKS)
 
 
 def valid_local_host(host, allow_loopback=False):
@@ -1521,7 +1531,7 @@ class ProviderManager:
         self._next_poll_at = {}        # conn_id -> monotonic timestamp
         # Server-side one-time pairing tokens (never emitted in snapshots!)
         self._paired_tokens = {}       # pair_id -> {"kind", "host", "port", "token", "fp", "expires"}
-        self._pending_cmds = {}        # (kind, rid) -> body (coalesced & bounded)
+        self._pending_cmds = {}        # (kind, rid) -> (conn generation, body) (coalesced & bounded)
         self._refresh_hold_until = 0.0
         self._last_refresh = 0.0
         self._worker_wake = threading.Event()
@@ -1543,7 +1553,8 @@ class ProviderManager:
 
     def load(self):
         path = self._path()
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        # O_NONBLOCK: a FIFO planted at this path must not block the helper before fstat rejects it
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
         try:
             fd = os.open(path, flags)
         except FileNotFoundError:
@@ -1567,10 +1578,13 @@ class ProviderManager:
                     self._load_blocked = True
                     self.load_warning = "providers.json permissions are too open and could not be fixed — refusing to overwrite."
                     return
-            with os.fdopen(fd, "r", encoding="utf-8") as fh:
+            with os.fdopen(fd, "rb") as fh:
                 fd = -1
-                raw = json.load(fh)
-        except (OSError, ValueError):
+                blob = fh.read(262145)
+            if len(blob) > 262144:
+                raise ValueError("providers.json too large")
+            raw = json.loads(blob.decode("utf-8"))
+        except (OSError, ValueError, RecursionError):
             self._load_blocked = True
             self.load_warning = "providers.json could not be parsed — refusing to overwrite."
             return
@@ -1580,13 +1594,20 @@ class ProviderManager:
                     os.close(fd)
                 except OSError:
                     pass
-        items = raw.get("providers") if isinstance(raw, dict) else (raw if isinstance(raw, list) else [])
+        items = raw.get("providers") if isinstance(raw, dict) else raw
+        if not isinstance(items, list):
+            self._load_blocked = True
+            self.load_warning = "providers.json could not be parsed — refusing to overwrite."
+            return
         loaded = []
         seen = set()
         for entry in items:
             if len(loaded) >= MAX_PROVIDERS:
                 break
-            clean_c = sanitize_connection(entry)
+            try:
+                clean_c = sanitize_connection(entry)
+            except (TypeError, ValueError, AttributeError, KeyError, RecursionError):
+                clean_c = None
             if clean_c and clean_c["id"] not in seen:
                 seen.add(clean_c["id"])
                 loaded.append(clean_c)
@@ -1693,6 +1714,7 @@ class ProviderManager:
                 if c["id"] == cid:
                     c["cert_fingerprint"] = ""
                     self.conn_generations[cid] = self.conn_generations.get(cid, 0) + 1
+                    self._drop_pending_for(cid)
                     self.errors.pop(cid, None)
                     self._fail_counts.pop(cid, None)
                     self._next_poll_at.pop(cid, None)
@@ -1730,6 +1752,7 @@ class ProviderManager:
                     raise ProviderError("Maximum number of devices reached.")
                 self.connections.append(clean_c)
             self.conn_generations[clean_c["id"]] = self.conn_generations.get(clean_c["id"], 0) + 1
+            self._drop_pending_for(clean_c["id"])
             self.errors.pop(clean_c["id"], None)
             self._fail_counts.pop(clean_c["id"], None)
             self._next_poll_at.pop(clean_c["id"], None)
@@ -1741,6 +1764,7 @@ class ProviderManager:
         with self.lock:
             self.connections = [c for c in self.connections if c["id"] != cid]
             self.conn_generations[cid] = self.conn_generations.get(cid, 0) + 1
+            self._drop_pending_for(cid)
             self.results.pop(cid, None)
             self.connected.pop(cid, None)
             self.errors.pop(cid, None)
@@ -1757,6 +1781,7 @@ class ProviderManager:
                 if c["id"] == cid:
                     c["enabled"] = bool(enabled)
                     self.conn_generations[cid] = self.conn_generations.get(cid, 0) + 1
+                    self._drop_pending_for(cid)
                     if not enabled:
                         self.results.pop(cid, None)
                         self.connected[cid] = False
@@ -1812,14 +1837,27 @@ class ProviderManager:
         self._refresh_hold_until = 0.0
         self._worker_wake.set()
 
+    @staticmethod
+    def _rid_conn_id(rid):
+        parts = str(rid or "").split(":", 2)
+        return parts[1] if len(parts) >= 2 else ""
+
+    def _drop_pending_for(self, cid):
+        """Forget queued commands of one connection (caller holds self.lock): after an edit, a
+        toggle or a removal they must never reach the new or a removed host."""
+        for key in [k for k in self._pending_cmds if self._rid_conn_id(k[1]) == cid]:
+            del self._pending_cmds[key]
+
     def queue_command(self, kind, rid, body):
         with self.lock:
             key = (kind, rid)
             if key not in self._pending_cmds and len(self._pending_cmds) >= MAX_PENDING_EXTRA:
                 return False
-            merged = dict(self._pending_cmds.get(key, {}))
+            gen = self.conn_generations.get(self._rid_conn_id(rid), 0)
+            prev = self._pending_cmds.get(key)
+            merged = dict(prev[1]) if prev and prev[0] == gen else {}
             merged.update(body)
-            self._pending_cmds[key] = merged
+            self._pending_cmds[key] = (gen, merged)
             self._refresh_hold_until = time.time() + 1.5
         self._worker_wake.set()
         return True
@@ -1828,8 +1866,11 @@ class ProviderManager:
         with self.lock:
             if not self._pending_cmds:
                 return False
-            key, body = next(iter(self._pending_cmds.items()))
+            key, (gen, body) = next(iter(self._pending_cmds.items()))
             del self._pending_cmds[key]
+            stale = self.conn_generations.get(self._rid_conn_id(key[1]), 0) != gen
+        if stale:
+            return True
         kind, rid = key
         try:
             if kind == "scene":
@@ -1919,7 +1960,12 @@ class ProviderManager:
             if fp_capture and gen is not None:
                 self._persist_captured_fp(conn["id"], gen, fp_capture[0])
             states = json.loads(raw.decode("utf-8"))
-            areas = self._fetch_ha_areas(conn, hdrs, fp_capture)
+            # Pin the follow-up request to the certificate just seen (trust on first use), so a
+            # certificate swap between the two requests cannot receive the bearer token.
+            pinned_conn = dict(conn)
+            if conn["use_https"] and not expected_fp and fp_capture:
+                pinned_conn["cert_fingerprint"] = fp_capture[0]
+            areas = self._fetch_ha_areas(pinned_conn, hdrs, [])
             rooms, sensors = parse_home_assistant_states(conn, states, entity_areas=areas)
             return rooms, sensors
 

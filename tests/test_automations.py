@@ -1779,7 +1779,7 @@ class FloorplanAndBridgeSyncTests(Base):
             ["python3", script, "floorplan_bg_set", png_src, "0.4", "cover"],
             capture_output=True, text=True, env=cli_env, check=True,
         )
-        cli_managed_png = os.path.join(self.dir, "omarchy", "hue-lights", "floorplan_bg.png")
+        cli_managed_png = os.path.join(self.dir, "omarchy", "lights", "floorplan_bg.png")
         out_set = json.loads(r_set.stdout)
         self.assertEqual(out_set["background"]["path"], cli_managed_png)
         self.assertEqual(out_set["background"]["opacity"], 0.4)
